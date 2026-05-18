@@ -1,0 +1,959 @@
+# Angular Frontend
+
+### File: frameworks\angular\src\angular-wrapper.ts
+```ts
+import 'zone.js';
+import { createApplication } from '@angular/platform-browser';
+import { createComponent, ApplicationRef, ComponentRef } from '@angular/core';
+import { SCENARIOS } from 'shared';
+
+const scenarioModules = import.meta.glob('./scenarios/*.ts', { eager: true });
+class AngularScenarioElement extends HTMLElement {
+	private appRef: ApplicationRef | null = null;
+	private componentRef: ComponentRef<unknown> | null = null;
+
+	async connectedCallback() {
+		// Read the tags from HTML element's attributes (created in the shell app)
+		const theme = this.getAttribute("theme") ?? "darkGold";
+		const scenarioId = this.getAttribute("scenario-id");
+		const scenario = SCENARIOS.find(s => s.id === scenarioId);
+		let ComponentClass = null;
+		if (scenario) {
+			const path = `./scenarios/${scenario.fileName}.ts`;
+			// Get the right module from Vite's Library
+			const module = scenarioModules[path] as Record<string, unknown>;
+			if (module) {
+				// Find first class (Angular components are exported as classes) or default export
+				ComponentClass = module['default'] || Object.values(module)[0];
+			}
+		}
+		const shadow = this.attachShadow({ mode: "open" });
+		const container = document.createElement("div");
+		container.style.width = "100%";
+		container.style.height = "100%";
+		shadow.appendChild(container);
+		if (ComponentClass && scenario) {
+			try {
+				// Create Angular app context
+				this.appRef = await createApplication();
+				// Create component and attach to container
+				this.componentRef = createComponent(ComponentClass, {
+					environmentInjector: this.appRef.injector,
+					hostElement: container
+				});
+				// Pass the parameters
+				this.componentRef.setInput('activeScenario', scenario);
+				this.componentRef.setInput('theme', theme);
+				// Attach component to Angular's Change Detection
+				this.appRef.attachView(this.componentRef.hostView);
+			} catch (error) {
+				console.error(`Failed loading Angular scenario: ${scenarioId}:`, error);
+				container.innerHTML = `<div>Error initializing Angular scenario</div>`;
+			}
+		} else {
+			container.innerHTML = `<div>Failed loading scenario: ${scenarioId}</div>`;
+			console.error(`Angular scenario not found: ${scenarioId}`);
+		}
+	}
+	disconnectedCallback() {
+		if (this.componentRef) {
+			this.componentRef.destroy();
+			this.componentRef = null;
+		}
+		if (this.appRef) {
+			this.appRef.destroy();
+			this.appRef = null;
+		}
+	}
+}
+if (!customElements.get("angular-scenario")) {
+	customElements.define("angular-scenario", AngularScenarioElement);
+}
+```
+
+### File: frameworks\angular\src\lc-context\lc-context.service.spec.ts
+```ts
+import { TestBed } from '@angular/core/testing';
+import { LcContextService } from './lc-context.service';
+import 'jasmine';
+
+describe('LcContextService', () => {
+	let service: LcContextService;
+
+	beforeEach(() => {
+		TestBed.configureTestingModule({});
+		service = TestBed.inject(LcContextService);
+	});
+
+	it('should be created', () => {
+		expect(service).toBeTruthy();
+	});
+});
+```
+
+### File: frameworks\angular\src\lc-context\lc-context.service.ts
+```ts
+import { Injectable } from '@angular/core';
+import { LightningChart, lightningChart } from '@lightningchart/lcjs';
+
+@Injectable({
+	providedIn: 'root',
+})
+export class LcContextService {
+	private lc?: LightningChart;
+
+	constructor() {}
+
+	public getLightningChartContext() {
+		if (this.lc) return this.lc;
+		this.lc = lightningChart({
+			// Place your LCJS license key here
+			// This should originate from a environment variable / secret. In development, license is assigned per developer, whereas in staging/production a deployment license is used.
+			license: import.meta.env.VITE_LCJS_LICENSE,
+		});
+		return this.lc;
+	}
+}
+```
+
+### File: frameworks\angular\src\scenarios\axis-switching.ts
+```ts
+import { afterNextRender, Component, ElementRef, Input, OnDestroy, ViewChild } from '@angular/core';
+import { Themes, PointLineAreaSeries, AxisTickStrategies, Axis, ChartXY, DataSetXY } from "@lightningchart/lcjs";
+import { LcContextService } from '../lc-context/lc-context.service';
+import { isLocalMode, getMockData, Scenario, SensorData } from "shared";
+
+@Component({
+	selector: 'axis-switching',
+	template: `
+        <div style="width: 100%; height: 100%; display: flex; flex-direction: column;">
+            <div style="width: 100%; display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 16px; padding: 8px 0px;">
+                <span style="margin-left: 8px;">Kinetic Energy Distribution of Machine Vibration (v<sup>2</sup>) Over a 5-Second Interval</span>
+                <span>Toggle axis type:</span>
+                <button style="margin-right: 8px;" (click)="toggleAxis()">
+                    {{ isLog ? 'Logarithmic' : 'Linear' }}
+                </button>
+            </div>
+            <div #chartRef style="width: 100%; flex-grow: 1; min-height: 0;"></div>
+        </div>
+    `,
+})
+export class AxisSwitching implements OnDestroy {
+    @ViewChild('chartRef', { static: false }) chartRef!: ElementRef<HTMLDivElement>;
+    @Input({ required: true }) theme!: keyof typeof Themes; 
+    @Input({ required: true }) activeScenario!: Scenario;
+    private destroyLC?: () => void;
+    private chartElements?: {
+        chart: ChartXY;
+        xAxis: Axis;
+        linAxis: Axis;
+        logAxis: Axis;
+        linSeries: PointLineAreaSeries;
+        logSeries: PointLineAreaSeries;
+    };
+    private dataSet = new DataSetXY({
+    	schema: {
+    		relativeTime: { pattern: 'progressive' },
+    		stress: { pattern: null },
+    	}
+    });
+    isLog = false;
+    
+    constructor(lcContextService: LcContextService) {
+    	afterNextRender(() => {
+    		const lc = lcContextService.getLightningChartContext();
+    		const container = this.chartRef.nativeElement;
+    		const chart = lc.ChartXY({ 
+    			legend: { visible: false },
+    			container, 
+    			theme: Themes[this.theme], 
+    		})			
+    			.setTitle('');
+    		const xAxis = chart.getDefaultAxisX().setTitle('Time').setTickStrategy(AxisTickStrategies.Time);
+    		const linAxis = chart.getDefaultAxisY().setTitle('Kinetic Energy (lin)');
+    		const logAxis = chart.addAxisY({ type: 'logarithmic', base: 10 }).setTitle('Kinetic Energy (log10)');
+    		const linSeries = chart.addLineSeries({ axisX: xAxis, axisY: linAxis, automaticColorIndex: 0 }).setName(`Linear Series`);
+    		const logSeries = chart.addLineSeries({ axisX: xAxis, axisY: logAxis, automaticColorIndex: 0 }).setName(`Logarithmic Series`);
+    		logSeries.setVisible(false);
+    		logAxis.setVisible(false);
+    		this.chartElements = { chart, linSeries, logSeries, xAxis, linAxis, logAxis };
+
+    		const setupData = async () => {
+    			try {
+    				let data: SensorData[][] = [];
+    				if (isLocalMode()) {
+    					const res = await fetch(`/api/scenarios/${this.activeScenario.fileName}`);
+    					data = await res.json();
+    				} else {
+    					data = getMockData(this.activeScenario);
+    				}
+    				if (chart.isDisposed()) return;
+                    
+    				this.dataSet.clear();
+    				this.dataSet.appendJSON(data, { whitelist: ['relativeTime', 'stress'] });
+    				linSeries.setDataSet(this.dataSet, { x: 'relativeTime', y: 'stress' });
+    				logSeries.setDataSet(this.dataSet, { x: 'relativeTime', y: 'stress' });
+    			} catch (err) {
+    				console.error("Failed to fetch data:", err);
+    				return;
+    			}
+    		};
+    		setupData();
+                        
+    		this.destroyLC = () => {
+    			chart.dispose();
+    		}    
+    	})
+    };
+    
+    toggleAxis = () => {
+    	this.isLog = !this.isLog;
+    	const chartElements = this.chartElements;
+    	if (!chartElements) return;
+    	const { linSeries, logSeries, xAxis, linAxis, logAxis } = chartElements;
+    	if (this.isLog) {
+    		linSeries.setVisible(false);
+    		linAxis.setVisible(false);
+    		logSeries.setVisible(true);
+    		logAxis.setVisible(true);
+    		logAxis.fit();
+    		xAxis.fit();
+    	} else {
+    		linSeries.setVisible(true);
+    		linAxis.setVisible(true);
+    		logSeries.setVisible(false);
+    		logAxis.setVisible(false);
+    		linAxis.fit();
+    		xAxis.fit();
+    	}
+    };
+    
+    ngOnDestroy(): void {
+    	if (this.destroyLC) {
+    		this.destroyLC();
+    	} 
+    };
+}
+```
+
+### File: frameworks\angular\src\scenarios\basic-chart-component.ts
+```ts
+import { afterNextRender, Component, ElementRef, Input, OnDestroy, ViewChild } from '@angular/core';
+import { Themes } from "@lightningchart/lcjs";
+import { LcContextService } from '../lc-context/lc-context.service';
+import { Scenario } from "shared";
+
+@Component({
+	selector: 'basic-chart-component',
+	template: `<div #chartRef style="width: 100%; height: 100%;"></div>`,
+})
+export class BasicChartComponent implements OnDestroy {
+    @ViewChild('chartRef', { static: false }) chartRef!: ElementRef<HTMLDivElement>;
+    @Input({ required: true }) theme!: keyof typeof Themes; 
+    @Input({ required: true }) activeScenario!: Scenario;
+    private destroyLC?: () => void;
+    
+    constructor(lcContextService: LcContextService) {
+    	afterNextRender(() => {
+    		const lc = lcContextService.getLightningChartContext();
+    		const container = this.chartRef.nativeElement;
+    		const chart = lc.ChartXY({ 
+    			container, 
+    			theme: Themes[this.theme], 
+    		})			
+    			.setTitle(`Angular: ${this.activeScenario.label}`);
+                
+    		const points= [];
+    		for (let i = 0; i < 20; i++) {
+    			points.push({
+    				x: i,
+    				y: i
+    			})
+    		}
+    		chart.addPointSeries({
+    			schema: {
+    				x: { pattern: 'progressive' },
+    				y: { pattern: 'progressive' }
+    			}
+    		})
+    			.appendJSON(points);
+
+    		this.destroyLC = () => {
+    			chart.dispose();
+    		}
+    	})
+    };
+    
+    ngOnDestroy(): void {
+    	if (this.destroyLC) {
+    		this.destroyLC(); 
+    	} 
+    };
+}
+```
+
+### File: frameworks\angular\src\scenarios\bubble-static.ts
+```ts
+import { afterNextRender, Component, ElementRef, Input, OnDestroy, ViewChild } from '@angular/core';
+import { Themes, PointLineAreaSeries, isHitSampleXY } from "@lightningchart/lcjs";
+import { LcContextService } from '../lc-context/lc-context.service';
+import { isLocalMode, getMockData, Scenario, SensorData } from "shared";
+
+@Component({
+	selector: 'bubble-static',
+	template: `<div #chartRef style="width: 100%; height: 100%;"></div>`,
+})
+export class BubbleStatic implements OnDestroy {
+    @ViewChild('chartRef', { static: false }) chartRef!: ElementRef<HTMLDivElement>;
+    @Input({ required: true }) theme!: keyof typeof Themes; 
+    @Input({ required: true }) activeScenario!: Scenario;
+    private destroyLC?: () => void;
+    
+    constructor(lcContextService: LcContextService) {
+    	afterNextRender(() => {
+    		const lc = lcContextService.getLightningChartContext();
+    		const container = this.chartRef.nativeElement;
+    		const chart = lc.ChartXY({ 
+    			container, 
+    			theme: Themes[this.theme], 
+    		})			
+    			.setTitle('Temperature and Vibration by Throughput')
+    			.setCursorMode('show-nearest');
+
+    		chart.axisX.setTitle('Temperature (°C)');
+    		chart.axisY.setTitle('Vibration (mm/s)');
+    		const allSeries: PointLineAreaSeries[] = [];
+    		for (let i = 0; i < 4; i += 1) {
+    			const series = chart.addPointSeries({
+    				schema: {
+    					temperature: { pattern: null },
+    					vibration: { pattern: null },
+    					throughput: { pattern: null },
+    					machineId: { nonNumeric: true }
+    				}
+    			})
+    				.setName(`Machine ${i + 1}`)
+    				.setDataMapping({ x: 'temperature', y: 'vibration', size: 'throughput' });
+    			allSeries.push(series);
+    		};
+
+    		const setupData = async () => {
+    			try {
+    				let data: SensorData[][] = [];
+    				if (isLocalMode()) {
+    					const res = await fetch(`/api/scenarios/${this.activeScenario.fileName}`);
+    					data = await res.json();
+    				} else {
+    					data = getMockData(this.activeScenario);
+    				}
+    				if (chart.isDisposed()) return;    
+                    
+    				for (let i = 0; i < allSeries.length; i++) {
+    					allSeries[i]
+    						.appendJSON(data[i], { whitelist: ['machineId', 'temperature', 'vibration', 'throughput'] });
+    				};
+    				chart.setCursorFormatting((_, hit) => {
+    					if (!isHitSampleXY(hit)) return undefined
+    					return [
+    						[{ text: 'Temperature (°C)', font: { weight: 'bold' } }, '', hit.x.toFixed(2)],
+    						[{ text: 'Vibration (mm/s)', font: { weight: 'bold' } }, '', hit.y.toFixed(2)],
+    						[{ text: 'Throughput', font: { weight: 'bold' } }, '', hit.size?.toFixed(0)]
+    					]
+    				});
+    			} catch (err) {
+    				console.error("Failed to fetch data:", err);
+    				return;
+    			}
+    		};
+    		setupData();
+
+    		this.destroyLC = () => {
+    			chart.dispose();
+    		}
+    	})
+    };
+    
+    ngOnDestroy(): void {
+    	if (this.destroyLC) {
+    		this.destroyLC();
+    	} 
+    };
+}
+```
+
+### File: frameworks\angular\src\scenarios\multi-realtime-binary.ts
+```ts
+import { afterNextRender, Component, ElementRef, Input, OnDestroy, ViewChild } from '@angular/core';
+import { Themes, PointLineAreaSeries, AxisTickStrategies, AxisScrollStrategies, PalettedFill, LUT, ColorRGBA, SolidLine } from "@lightningchart/lcjs";
+import { LcContextService } from '../lc-context/lc-context.service';
+import { isLocalMode, getMockData, Scenario, RealtimeBinaryData } from "shared";
+
+@Component({
+	selector: 'multi-realtime-binary',
+	template: `<div #chartRef style="width: 100%; height: 100%;"></div>`,
+})
+export class MultiRealtimeBinary implements OnDestroy {
+    @ViewChild('chartRef', { static: false }) chartRef!: ElementRef<HTMLDivElement>;
+    @Input({ required: true }) theme!: keyof typeof Themes; 
+    @Input({ required: true }) activeScenario!: Scenario;
+    private destroyLC?: () => void;
+    
+    constructor(lcContextService: LcContextService) {
+    	afterNextRender(() => {
+    		const lc = lcContextService.getLightningChartContext();
+    		const container = this.chartRef.nativeElement;
+    		const chart = lc.ChartXY({ 
+    			defaultAxisX: { type: 'linear-highPrecision', },
+    			legend: { visible: false },
+    			container, 
+    			theme: Themes[this.theme], 
+    		})			
+    			.setTitle('Real-Time Vibration Profile (M1-M3)');
+    		chart.getDefaultAxisX()
+    			.setTitle("Time")
+    			.setTickStrategy(AxisTickStrategies.DateTime)
+    			.setScrollStrategy(AxisScrollStrategies.scrolling)
+    			.setDefaultInterval((state) => ({ end: state.dataMax, start: (state.dataMax ?? 0) - 10 * 1000, stopAxisAfter: false }))
+    		chart.getDefaultAxisY().dispose();
+
+    		const palette = new PalettedFill({
+    			lookUpProperty: 'y',
+    			lut: new LUT({
+    				interpolate: false,
+    				steps: [
+    					{ value: 0, color: ColorRGBA( 255, 0, 0 ) },
+    					{ value: 0.2, color: ColorRGBA( 0, 255, 0 ) },
+    					{ value: 4.2, color: ColorRGBA( 255, 0, 0 ) }
+    				],
+    			})
+    		});
+		
+    		const allSeries: PointLineAreaSeries[] = [];
+    		for (let i = 0; i < 3; i++) {
+    			const axisY = chart
+    				.addAxisY({ iStack: -i })
+    				.setTitleRotation(0)
+    				.setMargins(i === 1 ? 15 : 0, i === 1 ? 15 : 0);
+    			if (i === 1) axisY.setTitle('Vibration (mm/s)').setTitleRotation(270);
+    			const series = chart.addLineSeries({ 
+    				axisY, 
+    				schema: {
+    					timestamps: { storage: Float64Array, pattern: 'progressive' },
+    					vibrations: { storage: Float32Array },
+    				} 
+    			})
+    				.setName(`Machine ${i+1}`)
+    			    // Data cleaning: set the maximum number of samples that are retained
+    				.setMaxSampleCount(50_000)
+    				.setDataMapping({ x: 'timestamps', y: 'vibrations' })
+    				.setStrokeStyle(new SolidLine({ fillStyle: palette}));
+    			allSeries.push(series);
+    		}
+    		let ws: WebSocket | null = null;
+    		let interval: ReturnType<typeof setInterval> | null = null;
+
+    		if (isLocalMode()) {
+    			ws = new WebSocket(`ws://localhost:3000/api/scenarios/${this.activeScenario.fileName}`);
+    			ws.binaryType = "arraybuffer";
+    			ws.onmessage = (e) => {
+    				try {
+    					const buffer = e.data as ArrayBuffer;
+    					const view = new DataView(buffer);
+    					const machineIndex = view.getUint8(0);
+    					const pointCount = (buffer.byteLength - 8) / 12;
+    					const timestamps = new Float64Array(buffer, 8, pointCount);
+    					const vibrations = new Float32Array(buffer, 8 + pointCount * 8, pointCount);
+    					allSeries[machineIndex].appendSamples({ 
+    						timestamps: timestamps, 
+    						vibrations: vibrations 
+    					});
+    				} catch (e) { 
+    					console.error(e); 
+    				}
+    			};
+    		} else {
+    			const data = getMockData(this.activeScenario) as RealtimeBinaryData[];
+    			let currentIndex = 0;
+    			const tempTimestamps = new Float64Array(1);
+    			const tempVibrations = new Float32Array(1);
+
+    			interval = setInterval(() => {
+    				if (currentIndex >= data[0].timestamps.length) {
+    					if (interval) clearInterval(interval);
+    					return;
+    				}
+    				for (let i = 0; i < allSeries.length; i++) {
+    					const machineData = data[i];
+    					tempTimestamps[0] = machineData.timestamps[currentIndex];
+    					tempVibrations[0] = machineData.vibrations[currentIndex];
+    					allSeries[i].appendSamples({
+    						timestamps: tempTimestamps,
+    						vibrations: tempVibrations
+    					});
+    				}
+    				currentIndex++;
+    			}, 20);
+    		}
+
+    		this.destroyLC = () => {
+    			if (ws) ws.close();
+    			if (interval) clearInterval(interval);
+    			chart.dispose();
+    		}
+    	})
+    };
+    
+    ngOnDestroy(): void {
+    	if (this.destroyLC) {
+    		this.destroyLC();
+    	} 
+    };
+}
+```
+
+### File: frameworks\angular\src\scenarios\multi-realtime.ts
+```ts
+import { afterNextRender, Component, ElementRef, Input, OnDestroy, ViewChild } from '@angular/core';
+import { Themes, PointLineAreaSeries, AxisTickStrategies, AxisScrollStrategies, PalettedFill, LUT, ColorRGBA, SolidLine } from "@lightningchart/lcjs";
+import { LcContextService } from '../lc-context/lc-context.service';
+import { isLocalMode, getMockData, Scenario, SensorData } from "shared";
+
+@Component({
+	selector: 'multi-realtime',
+	template: `<div #chartRef style="width: 100%; height: 100%;"></div>`,
+})
+export class MultiRealtime implements OnDestroy {
+    @ViewChild('chartRef', { static: false }) chartRef!: ElementRef<HTMLDivElement>;
+    @Input({ required: true }) theme!: keyof typeof Themes; 
+    @Input({ required: true }) activeScenario!: Scenario;
+    private destroyLC?: () => void;
+    
+    constructor(lcContextService: LcContextService) {
+    	afterNextRender(() => {
+    		const lc = lcContextService.getLightningChartContext();
+    		const container = this.chartRef.nativeElement;
+    		const chart = lc.ChartXY({ 
+    			defaultAxisX: { type: 'linear-highPrecision', },
+    			legend: { visible: false },
+    			container, 
+    			theme: Themes[this.theme], 
+    		})			
+    			.setTitle('Real-Time Vibration Profile (M1-M3)');
+    		chart.getDefaultAxisX()
+    			.setTitle("Time")
+    			.setTickStrategy(AxisTickStrategies.DateTime)
+    			.setScrollStrategy(AxisScrollStrategies.scrolling)
+    		    // Set view to 10 seconds.
+    			.setDefaultInterval((state) => ({ end: state.dataMax, start: (state.dataMax ?? 0) - 10 * 1000, stopAxisAfter: false }))
+    		chart.getDefaultAxisY().dispose();
+
+    		const palette = new PalettedFill({
+    			lookUpProperty: 'y',
+    			lut: new LUT({
+    				interpolate: false,
+    				steps: [
+    					{ value: 0, color: ColorRGBA( 255, 0, 0 ) },
+    					{ value: 0.2, color: ColorRGBA( 0, 255, 0 ) },
+    					{ value: 4.2, color: ColorRGBA( 255, 0, 0 ) }
+    				],
+    			})
+    		});
+		
+    		const allSeries: PointLineAreaSeries[] = [];
+    		for (let i = 0; i < 3; i++) {
+    			const axisY = chart
+    				.addAxisY({ iStack: -i })
+    				.setTitleRotation(0)
+    				.setMargins(i === 1 ? 15 : 0, i === 1 ? 15 : 0);    			
+    			if (i === 1) axisY.setTitle('Vibration (mm/s)').setTitleRotation(270);
+    			const series = chart.addLineSeries({ 
+    				axisY, 
+    				schema: {
+    					timestamp: { pattern: 'progressive' },
+    					vibration: { pattern: null },
+    					machineId: { nonNumeric: true }
+    				} 
+    			})
+    				.setName(`Machine ${i+1}`)
+    			    // Data cleaning: set the maximum number of samples that are retained
+    				.setMaxSampleCount(50_000)
+    				.setDataMapping({ x: 'timestamp', y: 'vibration' })
+    				.setStrokeStyle(new SolidLine({ fillStyle: palette}));
+    			allSeries.push(series);
+    		}
+    		let ws: WebSocket | null = null;
+    		let interval: ReturnType<typeof setInterval> | null = null;
+
+    		if (isLocalMode()) {
+    			ws = new WebSocket(`ws://localhost:3000/api/scenarios/${this.activeScenario.fileName}`);
+    			ws.onmessage = (e) => {
+    				try {
+    					const msg = JSON.parse(e.data);
+    					for (let i = 0; i < allSeries.length; i++) {
+    						allSeries[i].appendJSON(msg[i]);
+    					};
+    				} catch (e) { 
+    					console.error(e); 
+    				}
+    			};
+    		} else {
+    			const data = getMockData(this.activeScenario) as SensorData[][];
+    			let dataAmount = 0;
+    			interval = setInterval(() => {
+    				if (dataAmount >= data[0].length) {
+    					if (interval) clearInterval(interval);
+    					return;
+    				}
+    				for (let i = 0; i < allSeries.length; i++) {
+    					allSeries[i].appendJSON([{
+    						timestamp: data[i][dataAmount].timestamp,
+    						vibration: data[i][dataAmount].vibration,
+    						machineId: data[i][dataAmount].machineId
+    					}]);
+    				}
+    				dataAmount++;
+    			}, 20);
+    		}
+
+    		this.destroyLC = () => {
+    			if (ws) ws.close();
+    			if (interval) clearInterval(interval);
+    			chart.dispose();
+    		}
+    	})
+    };
+    
+    ngOnDestroy(): void {
+    	if (this.destroyLC) {
+    		this.destroyLC();
+    	} 
+    };
+}
+```
+
+### File: frameworks\angular\src\scenarios\multi-static-binary.ts
+```ts
+import { afterNextRender, Component, ElementRef, Input, OnDestroy, ViewChild } from '@angular/core';
+import { Themes, PointLineAreaSeries, AxisTickStrategies } from "@lightningchart/lcjs";
+import { LcContextService } from '../lc-context/lc-context.service';
+import { isLocalMode, getMockData, Scenario } from "shared";
+
+@Component({
+	selector: 'multi-static-binary',
+	template: `<div #chartRef style="width: 100%; height: 100%;"></div>`,
+})
+export class MultiStaticBinary implements OnDestroy {
+    @ViewChild('chartRef', { static: false }) chartRef!: ElementRef<HTMLDivElement>;
+    @Input({ required: true }) theme!: keyof typeof Themes; 
+    @Input({ required: true }) activeScenario!: Scenario;
+    private destroyLC?: () => void;
+    
+    constructor(lcContextService: LcContextService) {
+    	afterNextRender(() => {
+    		const lc = lcContextService.getLightningChartContext();
+    		const container = this.chartRef.nativeElement;
+    		const chart = lc.ChartXY({ 
+    			defaultAxisX: { type: 'linear-highPrecision', },
+    			container, 
+    			theme: Themes[this.theme], 
+    		})			
+    			.setTitle('Comparative Thermal Analysis of Production Units');
+    		chart.getDefaultAxisX().setTickStrategy(AxisTickStrategies.DateTime).setTitle('Time');
+    		const axisY = chart.getDefaultAxisY().setTitle('Temperature (°C)');
+    		const allSeries: PointLineAreaSeries[] = [];
+    		for (let i = 0; i < 3; i++) {
+    			const series = chart.addLineSeries({ 
+    				axisY, 
+    				schema: {
+    					x: { storage: Float64Array, pattern: 'progressive' },
+    					y: { storage: Float32Array }
+    				} 
+    			})
+    			series.setName(`Machine ${i+1}`);
+    			allSeries.push(series);
+    		};
+
+    		const setupData = async () => {
+    			try {
+    				let arrayBuffer: ArrayBuffer;
+    				let pointsCount: number;
+    				if (isLocalMode()) {
+    					const res = await fetch(`/api/scenarios/${this.activeScenario.fileName}`);
+    					// Parse custom header to get point counts
+    					const pointsCountHeader = res.headers.get('Points-Count');
+    					arrayBuffer = await res.arrayBuffer();
+    					pointsCount = pointsCountHeader ? parseInt(pointsCountHeader, 10) : arrayBuffer.byteLength / 20;
+    				} else {
+    					const data = getMockData(this.activeScenario);
+    					arrayBuffer = data.arrayBuffer;
+    					pointsCount = data.pointsCount;
+    				}
+    				if (chart.isDisposed()) return;
+    				const sharedTimestamps = new Float64Array(arrayBuffer, 0, pointsCount);
+    				const baseTemperatureByteOffset = pointsCount * 8;
+
+    				for (let i = 0; i < 3; i++) {
+    					const machineByteOffset = baseTemperatureByteOffset + (i * pointsCount * 4);
+    					const temperatures = new Float32Array(arrayBuffer, machineByteOffset, pointsCount);
+                
+    					allSeries[i].appendSamples({
+    						x: sharedTimestamps,
+    						y: temperatures,
+    					});
+    				}
+    			} catch (err) {
+    				console.error("Failed to fetch data:", err);
+    				return;
+    			}
+    		};
+    		setupData();
+
+    		this.destroyLC = () => {
+    			chart.dispose();
+    		}
+    	})
+    };
+    
+    ngOnDestroy(): void {
+    	if (this.destroyLC) {
+    		this.destroyLC();
+    	} 
+    };
+}
+```
+
+### File: frameworks\angular\src\scenarios\multi-static.ts
+```ts
+import { afterNextRender, Component, ElementRef, Input, OnDestroy, ViewChild } from '@angular/core';
+import { Themes, PointLineAreaSeries, AxisTickStrategies } from "@lightningchart/lcjs";
+import { LcContextService } from '../lc-context/lc-context.service';
+import { isLocalMode, getMockData, Scenario, SensorData } from "shared";
+
+@Component({
+	selector: 'multi-static',
+	template: `<div #chartRef style="width: 100%; height: 100%;"></div>`,
+})
+export class MultiStatic implements OnDestroy {
+    @ViewChild('chartRef', { static: false }) chartRef!: ElementRef<HTMLDivElement>;
+    @Input({ required: true }) theme!: keyof typeof Themes; 
+    @Input({ required: true }) activeScenario!: Scenario;
+    private destroyLC?: () => void;
+    
+    constructor(lcContextService: LcContextService) {
+    	afterNextRender(() => {
+    		const lc = lcContextService.getLightningChartContext();
+    		const container = this.chartRef.nativeElement;
+    		const chart = lc.ChartXY({ 
+    			defaultAxisX: { type: 'linear-highPrecision', },
+    			container, 
+    			theme: Themes[this.theme], 
+    		})			
+			    .setTitle('Comparative Thermal Analysis of Production Units');
+    		chart.getDefaultAxisX().setTickStrategy(AxisTickStrategies.DateTime).setTitle('Time');
+    		const axisY = chart.getDefaultAxisY().setTitle('Temperature (°C)');
+    		const allSeries: PointLineAreaSeries[] = [];
+    		for (let i = 0; i < 3; i++) {
+    			const series = chart.addLineSeries({ 
+    				axisY, 
+    				schema: {
+    					timestamp: { pattern: 'progressive' },
+    					temperature: { pattern: null },
+    					machineId: { nonNumeric: true }
+    				} 
+    			})
+    			series.setName(`Machine ${i+1}`).setDataMapping({ x: 'timestamp', y: 'temperature' });
+    			allSeries.push(series);
+    		};
+
+    		const setupData = async () => {
+    			try {
+    				let data: SensorData[][] = [];
+    				if (isLocalMode()) {
+    					const res = await fetch(`/api/scenarios/${this.activeScenario.fileName}`);
+    					data = await res.json();
+    				} else {
+    					data = getMockData(this.activeScenario) as SensorData[][];
+    				}
+    				if (chart.isDisposed()) return;
+                    
+    				for (let i = 0; i < allSeries.length; i++) {
+    					allSeries[i].appendJSON(data[i]);
+    				};
+    			} catch (err) {
+    				console.error("Failed to fetch data:", err);
+    				return;
+    			}
+    		};
+    		setupData();
+
+    		this.destroyLC = () => {
+    			chart.dispose();
+    		}
+    	})
+    };
+    
+    ngOnDestroy(): void {
+    	if (this.destroyLC) {
+    		this.destroyLC();
+    	} 
+    };
+}
+```
+
+### File: frameworks\angular\src\scenarios\synced-charts.ts
+```ts
+import { afterNextRender, Component, ElementRef, Input, OnDestroy, signal, ViewChild } from '@angular/core';
+import { Themes, PointLineAreaSeries, AxisTickStrategies, CursorXY, ChartXY, DataSetXY, synchronizeAxisIntervals } from "@lightningchart/lcjs";
+import { LcContextService } from '../lc-context/lc-context.service';
+import { isLocalMode, getMockData, Scenario, SensorData } from "shared";
+
+@Component({
+	selector: 'synced-charts',
+	template: `
+        <div style="width: 100%; height: 100%; display: grid; grid-template-columns: repeat(2, 1fr); grid-template-rows: repeat(2, 1fr);">
+            <div style="padding: 8px;">
+                @if (panelData()) {
+                    <strong>Synchronized Multivariate Production Telemetry</strong><br />
+                    <br />
+                    Production unit: <strong>Machine 1</strong><br />
+                    Average temperature: <strong>{{ panelData()!.temp }}</strong> °C<br>
+                    Average vibration: <strong>{{ panelData()!.vib }}</strong> mm/s<br>
+                    Average throughput: <strong>{{ panelData()!.tp }}</strong> units per second
+                } @else {
+                    Loading data...
+                }
+            </div>
+            <div #chartRef1></div>
+            <div #chartRef2></div>
+            <div #chartRef3></div>
+        </div>
+    `,
+})
+export class SyncedCharts implements OnDestroy {
+    @ViewChild('chartRef1', { static: false }) chartRef1!: ElementRef<HTMLDivElement>;
+    @ViewChild('chartRef2', { static: false }) chartRef2!: ElementRef<HTMLDivElement>;
+    @ViewChild('chartRef3', { static: false }) chartRef3!: ElementRef<HTMLDivElement>;
+    @Input({ required: true }) theme!: keyof typeof Themes; 
+    @Input({ required: true }) activeScenario!: Scenario;
+    private destroyLC?: () => void;
+    private dataSet = new DataSetXY({
+    	schema: {
+    		timestamp: { pattern: 'progressive' },
+    		temperature: { pattern: null },
+    		vibration: { pattern: null },
+    		throughput: { pattern: null }
+    	}
+    });
+    private VALUES: string[] = ['temperature', 'vibration', 'throughput'];
+    private TITLES: string[] = ['Thermal Output Profile (°C)', 'Mechanical Kinematics Profile (mm/s)', 'Production Throughput Efficiency (units/s)'];
+    panelData = signal<{ temp: string; vib: string; tp: string } | null>(null);
+        
+    constructor(lcContextService: LcContextService) {
+    	afterNextRender(() => {
+    		const lc = lcContextService.getLightningChartContext();
+    		const containers = [this.chartRef1, this.chartRef2, this.chartRef3];		
+    		const charts = containers.map((container, i) => {
+    			const chart: ChartXY = lc.ChartXY({
+    				defaultAxisX: { type: 'linear-highPrecision' },
+    				theme: Themes[this.theme], 
+    				container: container.nativeElement,
+    			})
+				    .setTitle(`${this.TITLES[i]}`)
+    				.setCursorMode(undefined);
+    			chart.getDefaultAxisX().setTickStrategy(AxisTickStrategies.DateTime);
+    			const series = chart.addLineSeries().setName(`${this.VALUES[i]}`);
+    			const cursor: CursorXY = chart.addCursor();
+    			cursor.setTickMarkerXVisible(false);
+    			return { chart, cursor, series };
+    		})
+    		synchronizeAxisIntervals(...charts.map((chart) => chart.chart.axisX));
+
+    		const hideCursor = () => {
+    			charts.forEach((chart) => chart.cursor.setVisible(false))
+    		};
+    		const displayCursorAt = (x: number) => {
+    			charts.forEach((chart) => {
+    				const solveResults = chart.chart
+    					.getSeries()
+				        // NOTE: Other series types don't currently have direct API syntax to solve nearest from axis coordinate - for them, you have to first translate axis coordinate to client coordinate and then use solve nearest
+    					.map((series) => series.getCursorEnabled() && series instanceof PointLineAreaSeries && series.solveNearest({ x, y: 0 }))
+    					.filter((solve) => !!solve);
+    				if (solveResults.length > 0) {
+    					chart.cursor
+    						.setVisible(true)
+    						.setPosition(...solveResults.map((solve) => solve.cursorPosition))
+    						.setResultTable((rt) => rt.setContent(chart.chart.getCursorFormatting()(chart.chart, solveResults[0], solveResults)));
+    				} else {
+    					chart.cursor.setVisible(false);
+    				}
+    			});
+    		};
+    		charts.forEach((chart) => {
+    			chart.chart.seriesBackground.addEventListener('pointermove', (event) =>
+    				displayCursorAt(chart.chart.translateCoordinate(event, chart.chart.coordsAxis).x),
+    			);
+    			chart.chart.getSeries().forEach((series) => series.addEventListener('pointermove', (_event, info) => displayCursorAt(info.x)));
+    			chart.chart.seriesBackground.addEventListener('pointerleave', () => hideCursor());
+    		});
+    		const setupData = async () => {
+    			if (!charts || !this.activeScenario) return;
+    			try {
+    				let data: SensorData[][] = [];
+    				if (isLocalMode()) {
+    					const res = await fetch(`/api/scenarios/${this.activeScenario.fileName}`);
+    					data = await res.json();
+    				} else {
+    					data = getMockData(this.activeScenario) as SensorData[][];
+    				}
+    				this.dataSet.clear();
+    				this.dataSet.appendJSON(data, { whitelist: ['timestamp', this.VALUES[0], this.VALUES[1], this.VALUES[2]] });
+    				for (let i = 0; i < charts.length; i++) {
+    					charts[i].series.setDataSet(this.dataSet, { x: 'timestamp', y: this.VALUES[i] });
+    				};
+    				const countAverage = (property: string) => {
+    					const array = this.dataSet.readBack().data[property]
+    					let total = 0
+    					for (let i = 0; i < array.length; i++) {
+    						total += array[i];
+    					}
+    					return total / array.length;
+    				}
+    				this.panelData.set({
+    					temp: countAverage(this.VALUES[0]).toFixed(2),
+    					vib: countAverage(this.VALUES[1]).toFixed(2),
+    					tp: (countAverage(this.VALUES[2]) * 100).toFixed(0)
+    				});
+    			} catch (err) {
+    				console.error("Failed to fetch data:", err);
+    				return;
+    			}
+    		};
+    		setupData();
+
+    		this.destroyLC = () => {
+    			charts.forEach(chart => chart.chart.dispose());
+    		}    
+    	})
+    };
+
+    ngOnDestroy(): void {
+    	if (this.destroyLC) {
+    		this.destroyLC();
+    	} 
+    };
+}
+```
+
+### File: frameworks\angular\src\vite-env.d.ts
+```ts
+/// <reference types="vite/client" />
+
+interface ImportMetaEnv {
+  readonly VITE_LCJS_LICENSE: string;
+}
+
+interface ImportMeta {
+  readonly env: ImportMetaEnv;
+}
+```
+

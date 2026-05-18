@@ -1,0 +1,521 @@
+# Shared Logic & Mock Data
+
+### File: shared\src\index.ts
+```ts
+import { basicInfo, bubbleInfo, multiStaticInfo , multiStaticBinaryInfo , syncedChartsInfo , axisSwitchingInfo , multiRealtimeInfo, multiRealtimeBinaryInfo } from './infoTexts.js'
+
+export * from './mockData.js';
+declare global {
+    interface Window {
+        __IS_LOCAL_MODE__?: boolean;    
+    }
+}
+
+export const isLocalMode = (): boolean => {
+	if (typeof window === 'undefined') return true;
+	if (typeof window.__IS_LOCAL_MODE__ !== 'undefined') return window.__IS_LOCAL_MODE__;
+	if (import.meta.env && import.meta.env.DEV) return true;
+	return false;
+};
+
+// Types
+export interface Framework {
+  id: 'react' | 'vue' | 'angular' | 'svelte' | 'vanillajs';
+  label: string;
+  extension: string;
+  language: string;}
+
+export interface Scenario {
+  id: string;
+  label: string;
+  fileName: string;
+  backend?: 'rest' | 'ws';
+  info: string;
+}
+export interface SensorData {  
+    machineId: string;
+    timestamp?: string | number;
+    temperature?: number;
+    vibration?: number;
+    throughput?: number;
+    status?: string;
+    relativeTime?: number;
+    stress?: number;  
+}
+
+export interface MultiStaticBinaryData {
+    arrayBuffer: ArrayBuffer;
+    pointsCount: number;
+}
+
+export interface RealtimeBinaryData {
+    timestamps: Float64Array;
+    vibrations: Float32Array;
+}
+
+export type GeneratedMockData = 
+    | SensorData[][] 
+    | SensorData[] 
+    | MultiStaticBinaryData 
+    | RealtimeBinaryData[];
+
+// Data
+export const FRAMEWORKS: Framework[] = [
+	{
+		id: 'react',
+		label: 'React',
+		extension: 'tsx',
+		language: 'typescript'
+	},
+	{
+		id: 'vue',
+		label: 'Vue',
+		extension: 'vue',
+		language: 'vue'
+	},
+	{
+		id: 'angular',
+		label: 'Angular',
+		extension: 'ts',
+		language: 'angular-ts'
+	},
+	{
+		id: 'svelte',
+		label: 'Svelte',
+		extension: 'svelte',
+		language: 'svelte'
+	},
+	{
+		id: 'vanillajs',
+		label: 'Vanilla JS',
+		extension: 'js',
+		language: 'javascript'
+	}
+];
+
+export const SCENARIOS: Scenario[] = [
+	{
+		id: 'basic-chart-component',
+		label: 'Basic Chart Component',
+		fileName: 'basic-chart-component',
+		info: basicInfo,
+	},
+	{
+		id: 'bubble-static',
+		label: 'Bubble Chart (Static, JSON)',
+		fileName: 'bubble-static',
+		backend: 'rest',
+		info: bubbleInfo,
+	},
+	{
+		id: 'multi-static',
+		label: 'Multi-channel Line Chart (Static, JSON)',
+		fileName: 'multi-static',
+		backend: 'rest',
+		info: multiStaticInfo,
+	},
+	{
+		id: 'multi-static-binary',
+		label: 'Multi-channel Line Chart (Static, Binary)',
+		fileName: 'multi-static-binary',
+		backend: 'rest',
+		info: multiStaticBinaryInfo,
+	},
+	{
+		id: 'synced-charts',
+		label: 'Synced Charts (DataSet Sharing)',
+		fileName: 'synced-charts',
+		backend: 'rest',
+		info: syncedChartsInfo,
+	},
+	{
+		id: 'axis-switching',
+		label: 'Axis Type Switching',
+		fileName: 'axis-switching',
+		backend: 'rest',
+		info: axisSwitchingInfo,
+	},
+	{
+		id: 'multi-realtime',
+		label: 'Multi-channel Line Chart (Real Time, JSON)',
+		fileName: 'multi-realtime',
+		backend: 'ws',
+		info: multiRealtimeInfo,
+	},
+	{
+		id: 'multi-realtime-binary',
+		label: 'Multi-channel Line Chart (Real Time, Binary)',
+		fileName: 'multi-realtime-binary',
+		backend: 'ws',
+		info: multiRealtimeBinaryInfo,
+	}
+];
+```
+
+### File: shared\src\infoTexts.ts
+```ts
+export const basicInfo = `
+Basic chart component demonstrates how to create a chart at a specific location in app. LightningChart [components are positioned](https://lightningchart.com/js-charts/docs/more-guides/positioning-charts/) using HTML <div> elements and CSS.\n
+[LC license key](https://lightningchart.com/js-charts/#license-key) is passed through LCContext (React) or when creating a chart.\n
+[Destroying components](https://lightningchart.com/js-charts/docs/more-guides/dispose/)
+`;
+
+export const bubbleInfo = `
+This example demonstrates how to load remote static data to chart.\n
+[Mapping data to correct format](https://lightningchart.com/js-charts/docs/more-guides/optimizing-performance/#mapping-data-to-correct-format)\n
+lineSeries.appendJSON(data, { whitelist: ['timestamp', 'value'] })
+`;
+
+export const multiStaticInfo = `
+This example demonstrates how to load remote static data with timestamps to chart as JSON.\n
+The X-axis needs to be zoomed in closer than around 1 day range, so the [high precision axis](https://lightningchart.com/js-charts/docs/features/axis/#zoom-ability) is enabled during chart creation with *defaultAxisX: { type: 'linear-highPrecision' }*.
+`;
+
+export const multiStaticBinaryInfo = `
+This example demonstrates how to load remote static data with timestamps to chart as optimized binary [columnar data](https://lightningchart.com/js-charts/docs/more-guides/optimizing-performance/#columnar-data-formats) response.\n
+The X-axis needs to be zoomed in closer than around 1 day range, so the [high precision axis](https://lightningchart.com/js-charts/docs/features/axis/#zoom-ability) is enabled during chart creation with *defaultAxisX: { type: 'linear-highPrecision' }*.
+`;
+
+export const syncedChartsInfo = `
+This example demonstrates utilizing LC [DataSetXY](https://lightningchart.com/js-charts/docs/features/xy/line/#separating-data-sets-from-series) as centralized data storage.\n 
+The synced charts and the [UI component](https://lightningchart.com/js-charts/docs/features/ui/) all use the same shared dataset.\n
+Define the needed values for each series separately: chart.series.setDataSet(dataSet, { x: 'timestamp', y: 'temperature });.\n
+The UI component calculates averages from the same data set by using dataSet.readBack() to get the data from the data set.
+`;
+
+export const axisSwitchingInfo = `
+This example demonstrates [switching between axis type](https://lightningchart.com/js-charts/docs/features/xy/line/#switching-between-axis-types) (lin/log) during run time.\n
+The axis type is switched using a shared data set, and updating the visible range of the axis to fit the data when switching to log axis.
+`;
+
+export const multiRealtimeInfo = `
+This example demonstrates how to connect real-time JSON data stream to chart using [WebSocket](https://lightningchart.com/js-charts/docs/more-guides/real-time-data/websocket/).\n
+In streaming use cases, memory usage can be limited by [configuring the maximum number of samples](https://lightningchart.com/js-charts/docs/features/xy/line/#data-cleaning--maximum-memory-use) that are retained.
+`;
+
+export const multiRealtimeBinaryInfo =  `
+This example demonstrates how to connect real-time data stream to chart with binary columnar data using [WebSocket](https://lightningchart.com/js-charts/docs/more-guides/real-time-data/websocket/).\n
+In streaming use cases, memory usage can be limited by [configuring the maximum number of samples](https://lightningchart.com/js-charts/docs/features/xy/line/#data-cleaning--maximum-memory-use) that are retained.\n
+For more complicated data structures, LightningChart also has available a [data transfer library](https://lightningchart.com/js-charts/docs/more-guides/real-time-data/websocket/#data-transfer-library) dedicated to high performance data transfer between a server and application.
+`;
+```
+
+### File: shared\src\mockData.ts
+```ts
+import { 
+	Scenario, 
+	SensorData, 
+	MultiStaticBinaryData, 
+	RealtimeBinaryData, 
+	GeneratedMockData 
+} from 'shared';
+
+declare global {
+    interface Window {
+        __SHARED_MOCK_CACHE__?: Record<string, GeneratedMockData>;
+    }
+}
+
+interface MachineProfile {
+    id: string;
+    tempMu: number;
+    tempTheta: number;
+    tempSigma: number;
+    vibMu: number;
+    vibTheta: number;
+    vibSigma: number;
+}
+
+// Helper functions for data generators
+const MACHINE_PROFILES: MachineProfile[] = [
+	{ id: 'M1', tempMu: 71.6, tempTheta: 0.02, tempSigma: 0.1, vibMu: 2.5, vibTheta: 0.05, vibSigma: 0.1 },
+	{ id: 'M2', tempMu: 75.6, tempTheta: 0.02, tempSigma: 0.1, vibMu: 3.2, vibTheta: 0.05, vibSigma: 0.1 },
+	{ id: 'M3', tempMu: 78.6, tempTheta: 0.02, tempSigma: 0.1, vibMu: 3.8, vibTheta: 0.05, vibSigma: 0.1 },
+	{ id: 'M4', tempMu: 73.6, tempTheta: 0.02, tempSigma: 0.1, vibMu: 2.9, vibTheta: 0.05, vibSigma: 0.1 }
+];
+
+const machineStates: Record<string, { temp: number; vib: number }> = {};
+
+const randomNormal = (mean: number, stdDev: number): number => {
+	let u = 0, v = 0;
+	while (u === 0) u = Math.random();
+	while (v === 0) v = Math.random();
+	const z = Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+	return mean + stdDev * z;
+};
+
+const updateOUProcess = (current: number, mu: number, theta: number, sigma: number): number => {
+	const drift = theta * (mu - current);
+	const diffusion = sigma * randomNormal(0, 1);
+	return current + drift + diffusion;
+};
+
+const getRandomThroughput = (): number => {
+	const r = Math.random();
+	if (r < 0.25) return 3;
+	if (r < 0.50) return 4;
+	if (r < 0.70) return 2;
+	if (r < 0.85) return 5;
+	if (r < 0.95) return 1;
+	return 0;
+};
+
+const getSeededRandom = (seed: number) => {
+	return function() {
+		seed = (seed * 9301 + 49297) % 233280;
+		return seed / 233280;
+	};
+};
+
+const createSeededNormal = (rng: () => number) => {
+	return (mean: number, stdDev: number): number => {
+		let u = 0, v = 0;
+		while (u === 0) u = rng();
+		while (v === 0) v = rng();
+		const z = Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+		return mean + stdDev * z;
+	};
+};
+
+const generateMachineDataPoint = (profile: MachineProfile) => {
+	if (!machineStates[profile.id]) {
+		machineStates[profile.id] = { temp: profile.tempMu, vib: profile.vibMu };
+	}
+	const state = machineStates[profile.id];
+	state.temp = updateOUProcess(state.temp, profile.tempMu, profile.tempTheta, profile.tempSigma);
+	state.vib = updateOUProcess(state.vib, profile.vibMu, profile.vibTheta, profile.vibSigma);
+	return {
+		temp_C: parseFloat(state.temp.toFixed(2)),
+		vibration_mm_s: parseFloat(state.vib.toFixed(2)),
+		status: state.vib >= 4.2 ? 'WARN' : 'OK'
+	};
+};
+
+const getStaticRawData = () => {
+	const pointsPerMachine = 30000;
+	const numMachines = 3;
+	const startTimeUnix = Date.parse('2025-02-12T10:00:00.000Z');
+	const rng = getSeededRandom(987654);
+	const seededNormal = createSeededNormal(rng);
+	const rawData = [
+		{ timestamps: new Float64Array(pointsPerMachine), temperatures: new Float32Array(pointsPerMachine) },
+		{ timestamps: new Float64Array(pointsPerMachine), temperatures: new Float32Array(pointsPerMachine) },
+		{ timestamps: new Float64Array(pointsPerMachine), temperatures: new Float32Array(pointsPerMachine) }
+	];
+	const mus = [71.6, 75.6, 78.6];
+	for (let m = 0; m < numMachines; m++) {
+		let temp = mus[m];
+		for (let i = 0; i < pointsPerMachine; i++) {
+			rawData[m].timestamps[i] = startTimeUnix + i * 10;
+			temp += 0.02 * (mus[m] - temp) + 0.1 * seededNormal(0, 1);
+			rawData[m].temperatures[i] = Number(temp.toFixed(2));
+		}
+	}
+	return { rawData, pointsPerMachine };
+};
+
+const getRealtimeRawData = () => {
+	const pointsPerMachine = 30000;
+	const numMachines = 3;
+	const startTimeUnix = Date.parse('2025-02-12T10:00:00.000Z');
+	const rng = getSeededRandom(123456);
+	const seededNormal = createSeededNormal(rng);
+	const rawData = [
+		{ timestamps: new Float64Array(pointsPerMachine), vibrations: new Float32Array(pointsPerMachine) },
+		{ timestamps: new Float64Array(pointsPerMachine), vibrations: new Float32Array(pointsPerMachine) },
+		{ timestamps: new Float64Array(pointsPerMachine), vibrations: new Float32Array(pointsPerMachine) }
+	];
+	const mus = [2.5, 3.2, 3.8];
+	const noiseLevels = [0.15, 0.20, 0.30];
+	for (let m = 0; m < numMachines; m++) {
+		let state = mus[m];
+		for (let i = 0; i < pointsPerMachine; i++) {
+			rawData[m].timestamps[i] = startTimeUnix + i * 10;
+            
+			state += 0.02 * (mus[m] - state) + 0.15 * seededNormal(0, 1);
+			const finalVib = state + noiseLevels[m] * seededNormal(0, 1);
+            
+			rawData[m].vibrations[i] = Number(Math.max(0.1, finalVib).toFixed(2));
+		}
+	}
+	return { rawData, pointsPerMachine };
+};
+
+// Scenario data generators
+const generateBubbleData = (): SensorData[][] => {
+	const data: SensorData[] = [];
+	const pointsPerMachine = 6000; 
+	for (let i = 0; i < pointsPerMachine; i++) {
+		MACHINE_PROFILES.forEach(profile => {
+			const point = generateMachineDataPoint(profile);
+			data.push({
+				machineId: profile.id,
+				temperature: point.temp_C,
+				vibration: point.vibration_mm_s,
+				throughput: getRandomThroughput() || 1
+			});
+		});
+	}
+	return [
+		data.filter(item => item.machineId === 'M1'),
+		data.filter(item => item.machineId === 'M2'),
+		data.filter(item => item.machineId === 'M3'),
+		data.filter(item => item.machineId === 'M4'),
+	];
+};
+
+const generateMultiStaticData = (): SensorData[][] => {
+	const { rawData, pointsPerMachine } = getStaticRawData();
+	const result: SensorData[][] = [[], [], []];
+	const machineIds = ['M1', 'M2', 'M3'];
+	for (let m = 0; m < 3; m++) {
+		for (let i = 0; i < pointsPerMachine; i++) {
+			result[m].push({
+				timestamp: new Date(rawData[m].timestamps[i]).toISOString(),
+				machineId: machineIds[m],
+				temperature: rawData[m].temperatures[i]
+			});
+		}
+	}
+	return result;
+};
+
+const generateMultiStaticBinaryData = (): MultiStaticBinaryData => {
+	const { rawData, pointsPerMachine } = getStaticRawData();
+	const buffer = new ArrayBuffer(pointsPerMachine * 8 + pointsPerMachine * 12);
+	const sharedTimestamps = new Float64Array(buffer, 0, pointsPerMachine);
+	const tempM1 = new Float32Array(buffer, pointsPerMachine * 8, pointsPerMachine);
+	const tempM2 = new Float32Array(buffer, pointsPerMachine * 8 + pointsPerMachine * 4, pointsPerMachine);
+	const tempM3 = new Float32Array(buffer, pointsPerMachine * 8 + pointsPerMachine * 8, pointsPerMachine);
+	for (let i = 0; i < pointsPerMachine; i++) {
+		sharedTimestamps[i] = rawData[0].timestamps[i];
+		tempM1[i] = rawData[0].temperatures[i];
+		tempM2[i] = rawData[1].temperatures[i];
+		tempM3[i] = rawData[2].temperatures[i];
+	}
+	return { arrayBuffer: buffer, pointsCount: pointsPerMachine };
+};
+
+const generateSyncedChartsData = (): SensorData[] => {
+	const data: SensorData[] = [];
+	const startTimeUnix = Date.parse('2025-02-12T10:00:00.000Z');
+	const profile = MACHINE_PROFILES[0]; 
+	const pointsPerMachine = 6000;
+	for (let i = 0; i < pointsPerMachine; i++) {
+		const timestamp = startTimeUnix + i * 10;
+		const point = generateMachineDataPoint(profile);
+		data.push({
+			timestamp: new Date(timestamp).toISOString(),
+			machineId: profile.id,
+			temperature: point.temp_C,
+			vibration: point.vibration_mm_s,
+			throughput: getRandomThroughput() || 1
+		});
+	}   
+	return data;
+};
+
+const generateAxisSwitchingData = (): SensorData[] => {
+	const data: SensorData[] = [];
+	const pointsPerMachine = 501; 
+	const rng = getSeededRandom(12345);
+	const seededNormal = createSeededNormal(rng);
+	for (let i = 0; i < pointsPerMachine; i++) {
+		const relativeTime = i * 10;
+		let simulatedVib = seededNormal(2.2, 0.8);
+		simulatedVib = Math.max(0.1, Math.min(simulatedVib, 4.5));
+		const stress = Math.max(0.1, Math.pow(simulatedVib, 2));
+		data.push({ machineId: 'M1', relativeTime, stress });
+	}
+	return data;
+};
+
+const generateMultiRealtimeData = (): SensorData[][] => {
+	const { rawData, pointsPerMachine } = getRealtimeRawData();
+	const result: SensorData[][] = [[], [], []];
+	const machineIds = ['M1', 'M2', 'M3'];
+	for (let m = 0; m < 3; m++) {
+		for (let i = 0; i < pointsPerMachine; i++) {
+			result[m].push({
+				timestamp: rawData[m].timestamps[i],
+				machineId: machineIds[m],
+				vibration: rawData[m].vibrations[i]
+			});
+		}
+	}
+	return result;
+};
+
+const generateMultiRealtimeBinaryData = (): RealtimeBinaryData[] => {
+	const { rawData } = getRealtimeRawData();
+	const result = [];
+	for (let m = 0; m < 3; m++) {
+		result.push({
+			timestamps: rawData[m].timestamps,
+			vibrations: rawData[m].vibrations
+		});
+	}
+	return result;
+};
+
+// Main function
+export const getMockData = (scenario: Scenario): GeneratedMockData => {
+	// Check if data for this scenario has already been created
+	if (typeof window !== 'undefined') {
+		if (!window.__SHARED_MOCK_CACHE__) {
+			window.__SHARED_MOCK_CACHE__ = {};
+		}
+		const cache = window.__SHARED_MOCK_CACHE__;
+		if (cache[scenario.id]) {
+			return cache[scenario.id];
+		}
+	}
+	let generatedData: GeneratedMockData;
+	switch (scenario.id) {
+	case 'bubble-static':
+		generatedData = generateBubbleData();
+		break;
+	case 'multi-static':
+		generatedData = generateMultiStaticData();
+		break;
+	case 'multi-static-binary':
+		generatedData = generateMultiStaticBinaryData();
+		break;
+	case 'synced-charts':
+		generatedData = generateSyncedChartsData();
+		break;
+	case 'axis-switching':
+		generatedData = generateAxisSwitchingData();
+		break;
+	case 'multi-realtime':
+		generatedData = generateMultiRealtimeData();
+		break;
+	case 'multi-realtime-binary':
+		generatedData = generateMultiRealtimeBinaryData();
+		break;
+	default:
+		console.warn(`No mock data generator defined for scenario: ${scenario.id}`);
+		generatedData = [];
+	}
+	// Save generated data to cache
+	if (typeof window !== 'undefined' && window.__SHARED_MOCK_CACHE__) {
+		window.__SHARED_MOCK_CACHE__[scenario.id] = generatedData;
+	}
+	return generatedData;
+};
+```
+
+### File: shared\src\vite-env.d.ts
+```ts
+interface ImportMetaEnv {
+  readonly MODE: string;
+  readonly DEV: boolean;
+  readonly PROD: boolean;
+  readonly VITE_LCJS_LICENSE: string;
+}
+
+interface ImportMeta {
+  readonly env: ImportMetaEnv;
+}
+```
+

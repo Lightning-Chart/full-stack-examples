@@ -1,0 +1,75 @@
+# Svelte Frontend
+
+### File: frameworks\svelte\src\app.d.ts
+```ts
+/// <reference types="vite/client" />
+
+interface ImportMetaEnv {
+  readonly VITE_LCJS_LICENSE: string;
+}
+
+interface ImportMeta {
+  readonly env: ImportMetaEnv;
+}
+```
+
+### File: frameworks\svelte\src\svelte-wrapper.ts
+```ts
+import { mount, unmount } from "svelte";
+import { SCENARIOS } from "shared";
+
+const scenarioModules = import.meta.glob('./scenarios/*.svelte', { eager: true });
+
+class SvelteScenarioElement extends HTMLElement {
+	private app: Record<string, unknown> | null = null;
+
+	constructor() {
+		super();
+	}
+
+	connectedCallback() {
+		// Read the tags from HTML element's attributes (created in the shell app)
+		const theme = this.getAttribute("theme") ?? "darkGold";
+		const scenarioId = this.getAttribute("scenario-id");
+		const scenario = SCENARIOS.find(s => s.id === scenarioId);
+		let Component = null;
+		if (scenario) {
+			const path = `./scenarios/${scenario.fileName}.svelte`;
+			// Get the right module from Vite's Library
+			const module = scenarioModules[path] as Record<string, unknown>;
+			if (module) {
+				// Exported component from the scenario file
+				Component = module.default || Object.values(module)[0];
+			}
+		}
+		const shadow = this.attachShadow({ mode: "open" });
+		const container = document.createElement("div");
+		container.style.width = "100%";
+		container.style.height = "100%";
+		shadow.appendChild(container);
+		if (Component && scenario) {
+			// Attach the component to target element
+			this.app = mount(Component, {
+				target: container,
+				props: { 
+					activeScenario: scenario, 
+					theme: theme 
+				}
+			});
+		} else {
+			container.innerHTML = `<div>Failed loading scenario: ${scenarioId}</div>`;
+			console.error(`Svelte scenario not found: ${scenarioId}`);
+		}
+	}
+	disconnectedCallback() {
+		if (this.app) {
+			unmount(this.app);
+			this.app = null;
+		}
+	}
+}
+if (!customElements.get("svelte-scenario")) {
+	customElements.define("svelte-scenario", SvelteScenarioElement);
+}
+```
+

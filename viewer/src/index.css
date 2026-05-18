@@ -1,0 +1,30 @@
+.h-resize-handle {
+  width: 4px;
+  background-color: transparent;
+  cursor: col-resize;
+}
+.h-resize-handle:hover {
+  background-color: #ffbb00;
+}
+.v-resize-handle {
+  height: 4px;
+  background-color: transparent;
+  cursor: row-resize;
+}
+.v-resize-handle:hover {
+  background-color: #ffbb00;
+}
+.box-left {
+  flex-shrink: 0;
+  height: '100%';
+  min-width: 200px;
+  border-right: '1px solid var(--mantine-color-dark-4)';
+}
+.box-right {
+  flex-grow: 1;
+  height: '100%';
+  min-width: 0;
+  overflow: 'hidden';
+  display: 'flex';
+  flex-direction: 'column';
+}

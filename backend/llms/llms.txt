@@ -1,0 +1,17 @@
+# LCJS Reference Implementations - AI Documentation
+
+This project contains high-performance chart integration examples for multiple frameworks.
+
+## Module Index
+
+- [Backend (Node.js & SQLite)](/backend.txt) - Implementation details for backend
+- [Shared Logic & Mock Data](/shared.txt) - Implementation details for shared
+- [React Frontend](/react.txt) - Implementation details for react
+- [Vue Frontend](/vue.txt) - Implementation details for vue
+- [Angular Frontend](/angular.txt) - Implementation details for angular
+- [Svelte Frontend](/svelte.txt) - Implementation details for svelte
+- [Vanilla JS Frontend](/vanillajs.txt) - Implementation details for vanillajs
+- [App Viewer (Main UI)](/viewer.txt) - Implementation details for viewer
+
+## Full Context
+- [Combined Source Code](/full.txt) - Everything in one file (use if you lack browsing capabilities)

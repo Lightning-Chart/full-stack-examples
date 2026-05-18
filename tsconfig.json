@@ -1,0 +1,14 @@
+// The root TypeScript configuration file for the project. 
+// It references all the sub-projects to allow for a unified TypeScript setup across the entire codebase.
+{
+  "files": [],
+  "references": [
+    { "path": "./backend" },
+    { "path": "./frameworks/react" },
+    { "path": "./frameworks/vue" },
+    { "path": "./frameworks/angular" },
+    { "path": "./frameworks/svelte" },
+    { "path": "./shared" },
+    { "path": "./viewer" }
+  ]
+}

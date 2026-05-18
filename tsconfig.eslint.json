@@ -1,0 +1,20 @@
+// This file is used by ESLint to understand the TypeScript configuration of the project.
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "allowJs": true
+  },
+  "include": [
+    "frameworks/**/*.ts",
+    "frameworks/**/*.tsx",
+    "frameworks/**/*.vue",
+    "frameworks/**/*.js",
+    "shared/**/*.ts",
+    "backend/**/*.ts",
+    "viewer/**/*.ts",
+    "viewer/**/*.tsx",
+    "**/*.d.ts",
+    "**/*.js",
+    "**/*.cjs"
+  ]
+}

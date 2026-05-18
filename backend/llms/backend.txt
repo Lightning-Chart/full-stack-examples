@@ -1,0 +1,430 @@
+# Backend (Node.js & SQLite)
+
+### File: backend\src\database.ts
+```ts
+import DatabaseConstructor from 'better-sqlite3';
+import path from 'node:path';
+import csvtojson from 'csvtojson';
+export const db: DatabaseConstructor.Database = new DatabaseConstructor('database.db');
+
+const relativePath = "shared/data/sensor_stream_100hz.csv";
+const absolutePath = path.resolve(import.meta.dirname, '../../', relativePath);
+
+export const initializeDatabase = async () => {
+	const query = `
+		CREATE TABLE IF NOT EXISTS sensor_data (
+			timestamp TEXT,
+			machineId TEXT,
+			temperature REAL,
+			vibration REAL,
+			throughput REAL,
+			status TEXT
+		);
+	`;
+	db.exec(query);
+
+	// Check if data exists already, if not insert some data
+	const checkData = db.prepare("SELECT count(*) as count FROM sensor_data").get() as { count: number };
+
+	if (checkData.count === 0) {
+		try {
+			const data = await csvtojson().fromFile(absolutePath);
+			const insertData = db.prepare("INSERT INTO sensor_data (timestamp, machineId, temperature, vibration, throughput, status) VALUES (?,?,?,?,?,?)");
+			const insertMany = db.transaction((rows) => {
+				for (const d of rows) {
+					insertData.run(d.timestamp, d.machine_id, d.temp_C, d.vibration_mm_s, d.throughput_units, d.status);
+				}
+			});
+			insertMany(data);
+			console.log(`Database initialized: ${data.length} rows inserted.`);
+		} catch (error) {
+			console.error('Error loading CSV data into database:', error);
+		}
+	} else {
+		console.log('Database already contains data, skipping CSV import.');
+	}
+};
+```
+
+### File: backend\src\scenarios\axis-switching.ts
+```ts
+import { Request, Response } from 'express';
+import { Database } from 'better-sqlite3';
+import { SensorData } from 'shared';
+
+export const handle = async (req: Request, res: Response, db: Database) => {
+	try {
+		const data = db.prepare(`
+            SELECT timestamp, machineId, vibration
+            FROM sensor_data 
+            WHERE timestamp >= '2025-02-12T10:00:55.000' 
+              AND timestamp <= '2025-02-12T10:01:00.000' 
+              AND machineId = 'M1'
+            ORDER BY timestamp ASC
+        `).all() as SensorData[];
+		if (data.length === 0) return res.json([]);
+		
+		const startTimeMs = new Date(data[0].timestamp).getTime();
+
+		const processedData = data.map(row => {
+			const currentTimeMs = new Date(row.timestamp).getTime();
+			const relativeTime = (currentTimeMs - startTimeMs);
+			// Calculate "stress" as the square of the absolute vibration value
+			const stress = Math.pow(Math.abs(row.vibration), 2);
+			// Ensure stress is never zero to avoid issues with logarithmic scale
+			const safeStress = Math.max(0.1, stress);
+			return { relativeTime, stress: safeStress };
+		});
+		res.json(processedData);
+	} catch (error) {
+		res.status(500).json({ error: `Database query failed: ${error}` });
+	}
+};
+```
+
+### File: backend\src\scenarios\basic-chart-component.ts
+```ts
+// No backend code needed.
+```
+
+### File: backend\src\scenarios\bubble-static.ts
+```ts
+import { Request, Response } from 'express';
+import { Database } from 'better-sqlite3';
+import { SensorData } from 'shared';
+
+export const handle = async (req: Request, res: Response, db: Database) => {
+	try {
+		const data = db.prepare(`
+			SELECT timestamp, machineId, temperature, vibration, throughput
+			FROM sensor_data 
+			WHERE timestamp < '2025-02-12T10:01:00.000'
+			ORDER BY machineId
+		`).all() as SensorData[];
+		if (data.length === 0) return res.json([]);
+        
+		const groupedData = [
+			data.filter((item: { machineId: string; }) => item.machineId === 'M1'),
+			data.filter((item: { machineId: string; }) => item.machineId === 'M2'),
+			data.filter((item: { machineId: string; }) => item.machineId === 'M3'),
+			data.filter((item: { machineId: string; }) => item.machineId === 'M4'),
+		];
+		res.json(groupedData);
+	} catch (error) {
+		res.status(500).json({ error: `Database query failed: ${error}` });
+	}
+}; 
+```
+
+### File: backend\src\scenarios\multi-realtime-binary.ts
+```ts
+import { Request, Response } from 'express';
+import { Database } from 'better-sqlite3';
+import { WebSocket } from 'ws';
+import { SensorData } from 'shared';
+
+export const handle = async (req: Request, res: Response, db: Database, ws?: WebSocket) => {
+	if (!ws) return;
+	const data = db.prepare(`
+        SELECT timestamp, machineId, vibration
+        FROM sensor_data 
+        ORDER BY timestamp  
+    `).all() as SensorData[];
+	if (data.length === 0) return res.json([]);
+
+	const groupedData = [
+		data.filter(item => item.machineId === 'M1'),
+		data.filter(item => item.machineId === 'M2'),
+		data.filter(item => item.machineId === 'M3'),
+	];
+	const startTime = performance.now();
+	let pointsSent = 0;
+	const maxPoints = groupedData[0].length;
+
+	const interval = setInterval(() => {
+		const elapsedMs = performance.now() - startTime;
+		// Calculate how many 10 ms steps should have been sent
+		const totalStepsTarget = Math.floor(elapsedMs / 10);
+		const stepsToSend = totalStepsTarget - pointsSent;
+		if (stepsToSend <= 0) return;
+
+		if (pointsSent < maxPoints) {
+			const startIndex = pointsSent;
+			const endIndex = Math.min(pointsSent + stepsToSend, maxPoints);
+			const currentBatchSize = endIndex - startIndex;
+			if (currentBatchSize <= 0) return;
+			// Send each machine's data as its own binary frame
+			groupedData.forEach((machineData, machineIndex) => {
+				const batch = machineData.slice(startIndex, endIndex);
+				if (batch.length === 0) return;
+				const buffer = new ArrayBuffer(8 + currentBatchSize * 8 + currentBatchSize * 4);
+				const view = new DataView(buffer);
+				// The first byte indicates the machine index (0, 1, or 2)
+				view.setUint8(0, machineIndex);
+				const timestamps = new Float64Array(buffer, 8, currentBatchSize);
+				const vibrations = new Float32Array(buffer, 8 + currentBatchSize * 8, currentBatchSize);
+				batch.forEach((row, i) => {
+					const ts = typeof row.timestamp === 'string' ? Date.parse(row.timestamp) : (row.timestamp ?? 0);
+					timestamps[i] = ts as number;
+					vibrations[i] = row.vibration ?? 0;
+				});
+				ws.send(Buffer.from(buffer), { binary: true });
+			});
+			pointsSent += currentBatchSize; 
+		} else {
+			clearInterval(interval);
+		}
+	}, 20);
+
+	ws.on('close', () => {
+		clearInterval(interval);
+		console.log("Connection closed.");
+	});
+};
+```
+
+### File: backend\src\scenarios\multi-realtime.ts
+```ts
+import { Request, Response } from 'express';
+import { Database } from 'better-sqlite3';
+import { WebSocket } from 'ws';
+import { SensorData } from 'shared';
+
+export const handle = async (req: Request, res: Response, db: Database, ws?: WebSocket) => {
+	if (!ws) return;
+	const data = db.prepare(`
+        SELECT timestamp, machineId, vibration
+        FROM sensor_data 
+        ORDER BY timestamp  
+    `).all() as SensorData[];
+	if (data.length === 0) return res.json([]);
+
+	const groupedData = [
+		data.filter((item: { machineId: string; }) => item.machineId === 'M1'),
+		data.filter((item: { machineId: string; }) => item.machineId === 'M2'),
+		data.filter((item: { machineId: string; }) => item.machineId === 'M3'),
+	];
+	const startTime = performance.now();
+	const pointsSent = 0;
+    
+	const interval = setInterval(() => {
+		const elapsedMs = performance.now() - startTime;
+		// Calculate how many 10 ms steps should have been sent
+		const totalStepsTarget = Math.floor(elapsedMs / 10);
+		const stepsToSend = totalStepsTarget - pointsSent;
+		if (stepsToSend > 0) {
+			// Check if there's any data left to send
+			if (pointsSent < groupedData[0].length) {
+			// Send data in batches corresponding to the number of steps to send
+				const startIndex = pointsSent;
+				const endIndex = pointsSent + stepsToSend;
+				const batch = [
+					groupedData[0].slice(startIndex, endIndex),
+					groupedData[1].slice(startIndex, endIndex),
+					groupedData[2].slice(startIndex, endIndex)
+				];
+				ws.send(JSON.stringify(batch));
+			} else {
+				clearInterval(interval);
+			}
+		}
+	}, 20);
+	ws.on('close', () => {
+		clearInterval(interval);
+		console.log("Connection closed.");
+	});
+};  
+```
+
+### File: backend\src\scenarios\multi-static-binary.ts
+```ts
+import { Request, Response } from 'express';
+import { Database } from 'better-sqlite3';
+import { SensorData } from 'shared';
+
+export const handle = async (req: Request, res: Response, db: Database) => {
+	try {
+		const data = db.prepare(`
+            SELECT timestamp, machineId, temperature
+            FROM sensor_data 
+            WHERE timestamp < '2025-02-12T10:05:00.000' AND machineId IN ('M1', 'M2', 'M3')
+            ORDER BY timestamp ASC
+        `).all() as SensorData[];
+		if (data.length === 0) return res.json([]);
+
+		const m1 = data.filter(item => item.machineId === 'M1');
+		const m2 = data.filter(item => item.machineId === 'M2');
+		const m3 = data.filter(item => item.machineId === 'M3');
+		const pointsPerMachine = m1.length;
+		const buffer = new ArrayBuffer(pointsPerMachine * 8 + pointsPerMachine * 12);
+		const timestamps = new Float64Array(buffer, 0, pointsPerMachine);
+		const tempM1 = new Float32Array(buffer, pointsPerMachine * 8, pointsPerMachine);
+		const tempM2 = new Float32Array(buffer, pointsPerMachine * 8 + pointsPerMachine * 4, pointsPerMachine);
+		const tempM3 = new Float32Array(buffer, pointsPerMachine * 8 + pointsPerMachine * 8, pointsPerMachine);
+
+		for (let i = 0; i < pointsPerMachine; i++) {
+			timestamps[i] = new Date(m1[i].timestamp).getTime();
+			tempM1[i] = m1[i].temperature;
+			tempM2[i] = m2[i]?.temperature ?? 0;
+			tempM3[i] = m3[i]?.temperature ?? 0;
+		}
+		res.setHeader('Points-Count', pointsPerMachine.toString());
+		res.setHeader('Content-Type', 'application/octet-stream');
+		res.send(Buffer.from(buffer));
+	} catch (error) {
+		res.status(500).json({ error: `Database query failed: ${error}` });
+	}
+};
+```
+
+### File: backend\src\scenarios\multi-static.ts
+```ts
+import { Request, Response } from 'express';
+import { Database } from 'better-sqlite3';
+import { SensorData } from 'shared';
+
+export const handle = async (req: Request, res: Response, db: Database) => {
+	try {
+		const data = db.prepare(`
+			SELECT timestamp, machineId, temperature
+			FROM sensor_data 
+			WHERE timestamp < '2025-02-12T10:05:00.000'
+			ORDER BY machineId
+		`).all() as SensorData[];
+		if (data.length === 0) return res.json([]);
+        
+		const groupedData = [
+			data.filter((item: { machineId: string; }) => item.machineId === 'M1'),
+			data.filter((item: { machineId: string; }) => item.machineId === 'M2'),
+			data.filter((item: { machineId: string; }) => item.machineId === 'M3'),
+		] as SensorData[][];
+		res.json(groupedData);
+	} catch (error) {
+		res.status(500).json({ error: `Database query failed: ${error}` });
+	}
+}; 
+
+
+```
+
+### File: backend\src\scenarios\synced-charts.ts
+```ts
+import { Request, Response } from 'express';
+import { Database } from 'better-sqlite3';
+import { SensorData } from 'shared';
+
+export const handle = async (req: Request, res: Response, db: Database) => {
+	try {
+		const data = db.prepare(`
+			SELECT timestamp, machineId, temperature, vibration, throughput
+			FROM sensor_data 
+			WHERE timestamp < '2025-02-12T10:01:00.000' AND machineId = 'M1'
+		`).all() as SensorData[];
+		if (data.length === 0) return res.json([]);
+
+		res.json(data);
+	} catch (error) {
+		res.status(500).json({ error: `Database query failed: ${error}` });
+	}
+}; 
+```
+
+### File: backend\src\server.ts
+```ts
+import express from 'express';
+import cors from 'cors';
+import path from 'node:path';
+import fs from 'node:fs';
+import { WebSocketServer } from 'ws';
+import { initializeDatabase, db } from './database.js';
+import { isLocalMode, SCENARIOS } from 'shared';
+
+const app = express();
+app.use(cors());
+const port = 3000;
+
+// Source code fetcher (for Shiki)
+app.get('/api/source', (req, res) => {
+	const relativePath = req.query.path as string;
+	const absolutePath = path.resolve(import.meta.dirname, '../../', relativePath);
+	try {
+		const content = fs.readFileSync(absolutePath, 'utf-8');
+		res.header('Content-Type', 'text/plain');
+		res.send(content);
+	} catch (error) {
+		res.status(404).json({ error: 'File not found:' + error });
+	}
+});
+
+// Serve llms-folder
+const llmsDir = path.join(import.meta.dirname, '../llms');
+app.use('/', express.static(llmsDir, {
+	setHeaders: (res, filePath) => {
+		if (filePath.endsWith('.txt')) {
+			res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+		}
+	}
+}));
+
+if (isLocalMode()) {
+	// Initialize database at server start
+	await initializeDatabase();
+
+	// REST scenario routing
+	// Directs requests to the right scenario file in /backend/src/scenarios/ based on /shared/scenarios.ts
+	SCENARIOS.forEach(scenario => {
+		if (scenario.backend === 'rest') {
+			app.get(`/api/scenarios/${scenario.fileName}`, async (req, res) => {
+				try {
+					const scenarioModule = await import(`./scenarios/${scenario.fileName}.ts`);
+					await scenarioModule.handle(req, res, db);
+				} catch (error) {
+					console.error(`Error handling scenario ${scenario.id}:`, error);
+					res.status(500).json({ error: 'Scenario handling failed' });
+				}
+			});
+		} else if (scenario.backend === 'ws') {
+			return;
+		} else {
+			console.warn(`Unknown backend type for scenario ${scenario.id}: ${scenario.backend}`);
+		}
+	});
+
+	// Start the server
+	const server = app.listen(port, () => {
+		console.log(`Backend running at http://localhost:${port}`)
+	})
+
+	// WebSocket server setup
+	const wss = new WebSocketServer({ server });
+
+	wss.on('connection', async (ws, req) => {
+		const url = req.url || '';
+		const urlParts = url.split('/');
+		const requestedFileName = urlParts[urlParts.length - 1];
+		const scenario = SCENARIOS.find(s => s.fileName === requestedFileName);
+        
+		if (!scenario || scenario.backend !== 'ws') {
+			console.warn(`WebSocket connection rejected: Scenario not found for URL ${url}`);
+			ws.close();
+			return;
+		}
+		try {
+			const scenarioModule = await import(`./scenarios/${scenario.fileName}.ts`);
+			await scenarioModule.handle(req, null, db, ws);    
+		} catch (error) {
+			console.error(`Error handling WebSocket scenario ${scenario.id}:`, error);
+			ws.close();
+		}
+		ws.on("close", () => {
+			console.log("Client disconnected");
+		});
+	});
+
+} else {
+	app.listen(port, () => {
+		console.log(`Server running at http://localhost:${port}`);
+	});
+}
+```
+
