@@ -1,0 +1,44 @@
+# --- General / System ---
+.DS_Store
+Thumbs.db
+*.log
+.env
+.env.local
+.env.production
+.env.*.local
+!.env.example
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# --- Dependency Folders ---
+node_modules/
+dist/
+build/
+out/
+.svelte-kit/
+.angular/
+
+# --- Framework Specifics ---
+# Angular
+.cache/
+.angular/cache/
+*.swp
+
+# Svelte
+.vercel/
+.netlify/
+
+# --- IDEs / Editors ---
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# --- Testing ---
+/coverage
+.nyc_output

@@ -1,0 +1,4885 @@
+# Full Source Code Compilation
+
+### File: backend\src\database.ts
+```ts
+import DatabaseConstructor from 'better-sqlite3';
+import path from 'node:path';
+import csvtojson from 'csvtojson';
+export const db: DatabaseConstructor.Database = new DatabaseConstructor('database.db');
+
+const relativePath = "shared/data/sensor_stream_100hz.csv";
+const absolutePath = path.resolve(import.meta.dirname, '../../', relativePath);
+
+export const initializeDatabase = async () => {
+	const query = `
+		CREATE TABLE IF NOT EXISTS sensor_data (
+			timestamp TEXT,
+			machineId TEXT,
+			temperature REAL,
+			vibration REAL,
+			throughput REAL,
+			status TEXT
+		);
+	`;
+	db.exec(query);
+
+	// Check if data exists already, if not insert some data
+	const checkData = db.prepare("SELECT count(*) as count FROM sensor_data").get() as { count: number };
+
+	if (checkData.count === 0) {
+		try {
+			const data = await csvtojson().fromFile(absolutePath);
+			const insertData = db.prepare("INSERT INTO sensor_data (timestamp, machineId, temperature, vibration, throughput, status) VALUES (?,?,?,?,?,?)");
+			const insertMany = db.transaction((rows) => {
+				for (const d of rows) {
+					insertData.run(d.timestamp, d.machine_id, d.temp_C, d.vibration_mm_s, d.throughput_units, d.status);
+				}
+			});
+			insertMany(data);
+			console.log(`Database initialized: ${data.length} rows inserted.`);
+		} catch (error) {
+			console.error('Error loading CSV data into database:', error);
+		}
+	} else {
+		console.log('Database already contains data, skipping CSV import.');
+	}
+};
+```
+
+### File: backend\src\scenarios\axis-switching.ts
+```ts
+import { Request, Response } from 'express';
+import { Database } from 'better-sqlite3';
+import { SensorData } from 'shared';
+
+export const handle = async (req: Request, res: Response, db: Database) => {
+	try {
+		const data = db.prepare(`
+            SELECT timestamp, machineId, vibration
+            FROM sensor_data 
+            WHERE timestamp >= '2025-02-12T10:00:55.000' 
+              AND timestamp <= '2025-02-12T10:01:00.000' 
+              AND machineId = 'M1'
+            ORDER BY timestamp ASC
+        `).all() as SensorData[];
+		if (data.length === 0) return res.json([]);
+		
+		const startTimeMs = new Date(data[0].timestamp).getTime();
+
+		const processedData = data.map(row => {
+			const currentTimeMs = new Date(row.timestamp).getTime();
+			const relativeTime = (currentTimeMs - startTimeMs);
+			// Calculate "stress" as the square of the absolute vibration value
+			const stress = Math.pow(Math.abs(row.vibration), 2);
+			// Ensure stress is never zero to avoid issues with logarithmic scale
+			const safeStress = Math.max(0.1, stress);
+			return { relativeTime, stress: safeStress };
+		});
+		res.json(processedData);
+	} catch (error) {
+		res.status(500).json({ error: `Database query failed: ${error}` });
+	}
+};
+```
+
+### File: backend\src\scenarios\basic-chart-component.ts
+```ts
+// No backend code needed.
+```
+
+### File: backend\src\scenarios\bubble-static.ts
+```ts
+import { Request, Response } from 'express';
+import { Database } from 'better-sqlite3';
+import { SensorData } from 'shared';
+
+export const handle = async (req: Request, res: Response, db: Database) => {
+	try {
+		const data = db.prepare(`
+			SELECT timestamp, machineId, temperature, vibration, throughput
+			FROM sensor_data 
+			WHERE timestamp < '2025-02-12T10:01:00.000'
+			ORDER BY machineId
+		`).all() as SensorData[];
+		if (data.length === 0) return res.json([]);
+        
+		const groupedData = [
+			data.filter((item: { machineId: string; }) => item.machineId === 'M1'),
+			data.filter((item: { machineId: string; }) => item.machineId === 'M2'),
+			data.filter((item: { machineId: string; }) => item.machineId === 'M3'),
+			data.filter((item: { machineId: string; }) => item.machineId === 'M4'),
+		];
+		res.json(groupedData);
+	} catch (error) {
+		res.status(500).json({ error: `Database query failed: ${error}` });
+	}
+}; 
+```
+
+### File: backend\src\scenarios\multi-realtime-binary.ts
+```ts
+import { Request, Response } from 'express';
+import { Database } from 'better-sqlite3';
+import { WebSocket } from 'ws';
+import { SensorData } from 'shared';
+
+export const handle = async (req: Request, res: Response, db: Database, ws?: WebSocket) => {
+	if (!ws) return;
+	const data = db.prepare(`
+        SELECT timestamp, machineId, vibration
+        FROM sensor_data 
+        ORDER BY timestamp  
+    `).all() as SensorData[];
+	if (data.length === 0) return res.json([]);
+
+	const groupedData = [
+		data.filter(item => item.machineId === 'M1'),
+		data.filter(item => item.machineId === 'M2'),
+		data.filter(item => item.machineId === 'M3'),
+	];
+	const startTime = performance.now();
+	let pointsSent = 0;
+	const maxPoints = groupedData[0].length;
+
+	const interval = setInterval(() => {
+		const elapsedMs = performance.now() - startTime;
+		// Calculate how many 10 ms steps should have been sent
+		const totalStepsTarget = Math.floor(elapsedMs / 10);
+		const stepsToSend = totalStepsTarget - pointsSent;
+		if (stepsToSend <= 0) return;
+
+		if (pointsSent < maxPoints) {
+			const startIndex = pointsSent;
+			const endIndex = Math.min(pointsSent + stepsToSend, maxPoints);
+			const currentBatchSize = endIndex - startIndex;
+			if (currentBatchSize <= 0) return;
+			// Send each machine's data as its own binary frame
+			groupedData.forEach((machineData, machineIndex) => {
+				const batch = machineData.slice(startIndex, endIndex);
+				if (batch.length === 0) return;
+				const buffer = new ArrayBuffer(8 + currentBatchSize * 8 + currentBatchSize * 4);
+				const view = new DataView(buffer);
+				// The first byte indicates the machine index (0, 1, or 2)
+				view.setUint8(0, machineIndex);
+				const timestamps = new Float64Array(buffer, 8, currentBatchSize);
+				const vibrations = new Float32Array(buffer, 8 + currentBatchSize * 8, currentBatchSize);
+				batch.forEach((row, i) => {
+					const ts = typeof row.timestamp === 'string' ? Date.parse(row.timestamp) : (row.timestamp ?? 0);
+					timestamps[i] = ts as number;
+					vibrations[i] = row.vibration ?? 0;
+				});
+				ws.send(Buffer.from(buffer), { binary: true });
+			});
+			pointsSent += currentBatchSize; 
+		} else {
+			clearInterval(interval);
+		}
+	}, 20);
+
+	ws.on('close', () => {
+		clearInterval(interval);
+		console.log("Connection closed.");
+	});
+};
+```
+
+### File: backend\src\scenarios\multi-realtime.ts
+```ts
+import { Request, Response } from 'express';
+import { Database } from 'better-sqlite3';
+import { WebSocket } from 'ws';
+import { SensorData } from 'shared';
+
+export const handle = async (req: Request, res: Response, db: Database, ws?: WebSocket) => {
+	if (!ws) return;
+	const data = db.prepare(`
+        SELECT timestamp, machineId, vibration
+        FROM sensor_data 
+        ORDER BY timestamp  
+    `).all() as SensorData[];
+	if (data.length === 0) return res.json([]);
+
+	const groupedData = [
+		data.filter((item: { machineId: string; }) => item.machineId === 'M1'),
+		data.filter((item: { machineId: string; }) => item.machineId === 'M2'),
+		data.filter((item: { machineId: string; }) => item.machineId === 'M3'),
+	];
+	const startTime = performance.now();
+	const pointsSent = 0;
+    
+	const interval = setInterval(() => {
+		const elapsedMs = performance.now() - startTime;
+		// Calculate how many 10 ms steps should have been sent
+		const totalStepsTarget = Math.floor(elapsedMs / 10);
+		const stepsToSend = totalStepsTarget - pointsSent;
+		if (stepsToSend > 0) {
+			// Check if there's any data left to send
+			if (pointsSent < groupedData[0].length) {
+			// Send data in batches corresponding to the number of steps to send
+				const startIndex = pointsSent;
+				const endIndex = pointsSent + stepsToSend;
+				const batch = [
+					groupedData[0].slice(startIndex, endIndex),
+					groupedData[1].slice(startIndex, endIndex),
+					groupedData[2].slice(startIndex, endIndex)
+				];
+				ws.send(JSON.stringify(batch));
+			} else {
+				clearInterval(interval);
+			}
+		}
+	}, 20);
+	ws.on('close', () => {
+		clearInterval(interval);
+		console.log("Connection closed.");
+	});
+};  
+```
+
+### File: backend\src\scenarios\multi-static-binary.ts
+```ts
+import { Request, Response } from 'express';
+import { Database } from 'better-sqlite3';
+import { SensorData } from 'shared';
+
+export const handle = async (req: Request, res: Response, db: Database) => {
+	try {
+		const data = db.prepare(`
+            SELECT timestamp, machineId, temperature
+            FROM sensor_data 
+            WHERE timestamp < '2025-02-12T10:05:00.000' AND machineId IN ('M1', 'M2', 'M3')
+            ORDER BY timestamp ASC
+        `).all() as SensorData[];
+		if (data.length === 0) return res.json([]);
+
+		const m1 = data.filter(item => item.machineId === 'M1');
+		const m2 = data.filter(item => item.machineId === 'M2');
+		const m3 = data.filter(item => item.machineId === 'M3');
+		const pointsPerMachine = m1.length;
+		const buffer = new ArrayBuffer(pointsPerMachine * 8 + pointsPerMachine * 12);
+		const timestamps = new Float64Array(buffer, 0, pointsPerMachine);
+		const tempM1 = new Float32Array(buffer, pointsPerMachine * 8, pointsPerMachine);
+		const tempM2 = new Float32Array(buffer, pointsPerMachine * 8 + pointsPerMachine * 4, pointsPerMachine);
+		const tempM3 = new Float32Array(buffer, pointsPerMachine * 8 + pointsPerMachine * 8, pointsPerMachine);
+
+		for (let i = 0; i < pointsPerMachine; i++) {
+			timestamps[i] = new Date(m1[i].timestamp).getTime();
+			tempM1[i] = m1[i].temperature;
+			tempM2[i] = m2[i]?.temperature ?? 0;
+			tempM3[i] = m3[i]?.temperature ?? 0;
+		}
+		res.setHeader('Points-Count', pointsPerMachine.toString());
+		res.setHeader('Content-Type', 'application/octet-stream');
+		res.send(Buffer.from(buffer));
+	} catch (error) {
+		res.status(500).json({ error: `Database query failed: ${error}` });
+	}
+};
+```
+
+### File: backend\src\scenarios\multi-static.ts
+```ts
+import { Request, Response } from 'express';
+import { Database } from 'better-sqlite3';
+import { SensorData } from 'shared';
+
+export const handle = async (req: Request, res: Response, db: Database) => {
+	try {
+		const data = db.prepare(`
+			SELECT timestamp, machineId, temperature
+			FROM sensor_data 
+			WHERE timestamp < '2025-02-12T10:05:00.000'
+			ORDER BY machineId
+		`).all() as SensorData[];
+		if (data.length === 0) return res.json([]);
+        
+		const groupedData = [
+			data.filter((item: { machineId: string; }) => item.machineId === 'M1'),
+			data.filter((item: { machineId: string; }) => item.machineId === 'M2'),
+			data.filter((item: { machineId: string; }) => item.machineId === 'M3'),
+		] as SensorData[][];
+		res.json(groupedData);
+	} catch (error) {
+		res.status(500).json({ error: `Database query failed: ${error}` });
+	}
+}; 
+
+
+```
+
+### File: backend\src\scenarios\synced-charts.ts
+```ts
+import { Request, Response } from 'express';
+import { Database } from 'better-sqlite3';
+import { SensorData } from 'shared';
+
+export const handle = async (req: Request, res: Response, db: Database) => {
+	try {
+		const data = db.prepare(`
+			SELECT timestamp, machineId, temperature, vibration, throughput
+			FROM sensor_data 
+			WHERE timestamp < '2025-02-12T10:01:00.000' AND machineId = 'M1'
+		`).all() as SensorData[];
+		if (data.length === 0) return res.json([]);
+
+		res.json(data);
+	} catch (error) {
+		res.status(500).json({ error: `Database query failed: ${error}` });
+	}
+}; 
+```
+
+### File: backend\src\server.ts
+```ts
+import express from 'express';
+import cors from 'cors';
+import path from 'node:path';
+import fs from 'node:fs';
+import { WebSocketServer } from 'ws';
+import { initializeDatabase, db } from './database.js';
+import { isLocalMode, SCENARIOS } from 'shared';
+
+const app = express();
+app.use(cors());
+const port = 3000;
+
+// Source code fetcher (for Shiki)
+app.get('/api/source', (req, res) => {
+	const relativePath = req.query.path as string;
+	const absolutePath = path.resolve(import.meta.dirname, '../../', relativePath);
+	try {
+		const content = fs.readFileSync(absolutePath, 'utf-8');
+		res.header('Content-Type', 'text/plain');
+		res.send(content);
+	} catch (error) {
+		res.status(404).json({ error: 'File not found:' + error });
+	}
+});
+
+// Serve llms-folder
+const llmsDir = path.join(import.meta.dirname, '../llms');
+app.use('/', express.static(llmsDir, {
+	setHeaders: (res, filePath) => {
+		if (filePath.endsWith('.txt')) {
+			res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+		}
+	}
+}));
+
+if (isLocalMode()) {
+	// Initialize database at server start
+	await initializeDatabase();
+
+	// REST scenario routing
+	// Directs requests to the right scenario file in /backend/src/scenarios/ based on /shared/scenarios.ts
+	SCENARIOS.forEach(scenario => {
+		if (scenario.backend === 'rest') {
+			app.get(`/api/scenarios/${scenario.fileName}`, async (req, res) => {
+				try {
+					const scenarioModule = await import(`./scenarios/${scenario.fileName}.ts`);
+					await scenarioModule.handle(req, res, db);
+				} catch (error) {
+					console.error(`Error handling scenario ${scenario.id}:`, error);
+					res.status(500).json({ error: 'Scenario handling failed' });
+				}
+			});
+		} else if (scenario.backend === 'ws') {
+			return;
+		} else {
+			console.warn(`Unknown backend type for scenario ${scenario.id}: ${scenario.backend}`);
+		}
+	});
+
+	// Start the server
+	const server = app.listen(port, () => {
+		console.log(`Backend running at http://localhost:${port}`)
+	})
+
+	// WebSocket server setup
+	const wss = new WebSocketServer({ server });
+
+	wss.on('connection', async (ws, req) => {
+		const url = req.url || '';
+		const urlParts = url.split('/');
+		const requestedFileName = urlParts[urlParts.length - 1];
+		const scenario = SCENARIOS.find(s => s.fileName === requestedFileName);
+        
+		if (!scenario || scenario.backend !== 'ws') {
+			console.warn(`WebSocket connection rejected: Scenario not found for URL ${url}`);
+			ws.close();
+			return;
+		}
+		try {
+			const scenarioModule = await import(`./scenarios/${scenario.fileName}.ts`);
+			await scenarioModule.handle(req, null, db, ws);    
+		} catch (error) {
+			console.error(`Error handling WebSocket scenario ${scenario.id}:`, error);
+			ws.close();
+		}
+		ws.on("close", () => {
+			console.log("Client disconnected");
+		});
+	});
+
+} else {
+	app.listen(port, () => {
+		console.log(`Server running at http://localhost:${port}`);
+	});
+}
+```
+
+### File: shared\src\index.ts
+```ts
+import { basicInfo, bubbleInfo, multiStaticInfo , multiStaticBinaryInfo , syncedChartsInfo , axisSwitchingInfo , multiRealtimeInfo, multiRealtimeBinaryInfo } from './infoTexts.js'
+
+export * from './mockData.js';
+declare global {
+    interface Window {
+        __IS_LOCAL_MODE__?: boolean;    
+    }
+}
+
+export const isLocalMode = (): boolean => {
+	if (typeof window === 'undefined') return true;
+	if (typeof window.__IS_LOCAL_MODE__ !== 'undefined') return window.__IS_LOCAL_MODE__;
+	if (import.meta.env && import.meta.env.DEV) return true;
+	return false;
+};
+
+// Types
+export interface Framework {
+  id: 'react' | 'vue' | 'angular' | 'svelte' | 'vanillajs';
+  label: string;
+  extension: string;
+  language: string;}
+
+export interface Scenario {
+  id: string;
+  label: string;
+  fileName: string;
+  backend?: 'rest' | 'ws';
+  info: string;
+}
+export interface SensorData {  
+    machineId: string;
+    timestamp?: string | number;
+    temperature?: number;
+    vibration?: number;
+    throughput?: number;
+    status?: string;
+    relativeTime?: number;
+    stress?: number;  
+}
+
+export interface MultiStaticBinaryData {
+    arrayBuffer: ArrayBuffer;
+    pointsCount: number;
+}
+
+export interface RealtimeBinaryData {
+    timestamps: Float64Array;
+    vibrations: Float32Array;
+}
+
+export type GeneratedMockData = 
+    | SensorData[][] 
+    | SensorData[] 
+    | MultiStaticBinaryData 
+    | RealtimeBinaryData[];
+
+// Data
+export const FRAMEWORKS: Framework[] = [
+	{
+		id: 'react',
+		label: 'React',
+		extension: 'tsx',
+		language: 'typescript'
+	},
+	{
+		id: 'vue',
+		label: 'Vue',
+		extension: 'vue',
+		language: 'vue'
+	},
+	{
+		id: 'angular',
+		label: 'Angular',
+		extension: 'ts',
+		language: 'angular-ts'
+	},
+	{
+		id: 'svelte',
+		label: 'Svelte',
+		extension: 'svelte',
+		language: 'svelte'
+	},
+	{
+		id: 'vanillajs',
+		label: 'Vanilla JS',
+		extension: 'js',
+		language: 'javascript'
+	}
+];
+
+export const SCENARIOS: Scenario[] = [
+	{
+		id: 'basic-chart-component',
+		label: 'Basic Chart Component',
+		fileName: 'basic-chart-component',
+		info: basicInfo,
+	},
+	{
+		id: 'bubble-static',
+		label: 'Bubble Chart (Static, JSON)',
+		fileName: 'bubble-static',
+		backend: 'rest',
+		info: bubbleInfo,
+	},
+	{
+		id: 'multi-static',
+		label: 'Multi-channel Line Chart (Static, JSON)',
+		fileName: 'multi-static',
+		backend: 'rest',
+		info: multiStaticInfo,
+	},
+	{
+		id: 'multi-static-binary',
+		label: 'Multi-channel Line Chart (Static, Binary)',
+		fileName: 'multi-static-binary',
+		backend: 'rest',
+		info: multiStaticBinaryInfo,
+	},
+	{
+		id: 'synced-charts',
+		label: 'Synced Charts (DataSet Sharing)',
+		fileName: 'synced-charts',
+		backend: 'rest',
+		info: syncedChartsInfo,
+	},
+	{
+		id: 'axis-switching',
+		label: 'Axis Type Switching',
+		fileName: 'axis-switching',
+		backend: 'rest',
+		info: axisSwitchingInfo,
+	},
+	{
+		id: 'multi-realtime',
+		label: 'Multi-channel Line Chart (Real Time, JSON)',
+		fileName: 'multi-realtime',
+		backend: 'ws',
+		info: multiRealtimeInfo,
+	},
+	{
+		id: 'multi-realtime-binary',
+		label: 'Multi-channel Line Chart (Real Time, Binary)',
+		fileName: 'multi-realtime-binary',
+		backend: 'ws',
+		info: multiRealtimeBinaryInfo,
+	}
+];
+```
+
+### File: shared\src\infoTexts.ts
+```ts
+export const basicInfo = `
+Basic chart component demonstrates how to create a chart at a specific location in app. LightningChart [components are positioned](https://lightningchart.com/js-charts/docs/more-guides/positioning-charts/) using HTML <div> elements and CSS.\n
+[LC license key](https://lightningchart.com/js-charts/#license-key) is passed through LCContext (React) or when creating a chart.\n
+[Destroying components](https://lightningchart.com/js-charts/docs/more-guides/dispose/)
+`;
+
+export const bubbleInfo = `
+This example demonstrates how to load remote static data to chart.\n
+[Mapping data to correct format](https://lightningchart.com/js-charts/docs/more-guides/optimizing-performance/#mapping-data-to-correct-format)\n
+lineSeries.appendJSON(data, { whitelist: ['timestamp', 'value'] })
+`;
+
+export const multiStaticInfo = `
+This example demonstrates how to load remote static data with timestamps to chart as JSON.\n
+The X-axis needs to be zoomed in closer than around 1 day range, so the [high precision axis](https://lightningchart.com/js-charts/docs/features/axis/#zoom-ability) is enabled during chart creation with *defaultAxisX: { type: 'linear-highPrecision' }*.
+`;
+
+export const multiStaticBinaryInfo = `
+This example demonstrates how to load remote static data with timestamps to chart as optimized binary [columnar data](https://lightningchart.com/js-charts/docs/more-guides/optimizing-performance/#columnar-data-formats) response.\n
+The X-axis needs to be zoomed in closer than around 1 day range, so the [high precision axis](https://lightningchart.com/js-charts/docs/features/axis/#zoom-ability) is enabled during chart creation with *defaultAxisX: { type: 'linear-highPrecision' }*.
+`;
+
+export const syncedChartsInfo = `
+This example demonstrates utilizing LC [DataSetXY](https://lightningchart.com/js-charts/docs/features/xy/line/#separating-data-sets-from-series) as centralized data storage.\n 
+The synced charts and the [UI component](https://lightningchart.com/js-charts/docs/features/ui/) all use the same shared dataset.\n
+Define the needed values for each series separately: chart.series.setDataSet(dataSet, { x: 'timestamp', y: 'temperature });.\n
+The UI component calculates averages from the same data set by using dataSet.readBack() to get the data from the data set.
+`;
+
+export const axisSwitchingInfo = `
+This example demonstrates [switching between axis type](https://lightningchart.com/js-charts/docs/features/xy/line/#switching-between-axis-types) (lin/log) during run time.\n
+The axis type is switched using a shared data set, and updating the visible range of the axis to fit the data when switching to log axis.
+`;
+
+export const multiRealtimeInfo = `
+This example demonstrates how to connect real-time JSON data stream to chart using [WebSocket](https://lightningchart.com/js-charts/docs/more-guides/real-time-data/websocket/).\n
+In streaming use cases, memory usage can be limited by [configuring the maximum number of samples](https://lightningchart.com/js-charts/docs/features/xy/line/#data-cleaning--maximum-memory-use) that are retained.
+`;
+
+export const multiRealtimeBinaryInfo =  `
+This example demonstrates how to connect real-time data stream to chart with binary columnar data using [WebSocket](https://lightningchart.com/js-charts/docs/more-guides/real-time-data/websocket/).\n
+In streaming use cases, memory usage can be limited by [configuring the maximum number of samples](https://lightningchart.com/js-charts/docs/features/xy/line/#data-cleaning--maximum-memory-use) that are retained.\n
+For more complicated data structures, LightningChart also has available a [data transfer library](https://lightningchart.com/js-charts/docs/more-guides/real-time-data/websocket/#data-transfer-library) dedicated to high performance data transfer between a server and application.
+`;
+```
+
+### File: shared\src\mockData.ts
+```ts
+import { 
+	Scenario, 
+	SensorData, 
+	MultiStaticBinaryData, 
+	RealtimeBinaryData, 
+	GeneratedMockData 
+} from 'shared';
+
+declare global {
+    interface Window {
+        __SHARED_MOCK_CACHE__?: Record<string, GeneratedMockData>;
+    }
+}
+
+interface MachineProfile {
+    id: string;
+    tempMu: number;
+    tempTheta: number;
+    tempSigma: number;
+    vibMu: number;
+    vibTheta: number;
+    vibSigma: number;
+}
+
+// Helper functions for data generators
+const MACHINE_PROFILES: MachineProfile[] = [
+	{ id: 'M1', tempMu: 71.6, tempTheta: 0.02, tempSigma: 0.1, vibMu: 2.5, vibTheta: 0.05, vibSigma: 0.1 },
+	{ id: 'M2', tempMu: 75.6, tempTheta: 0.02, tempSigma: 0.1, vibMu: 3.2, vibTheta: 0.05, vibSigma: 0.1 },
+	{ id: 'M3', tempMu: 78.6, tempTheta: 0.02, tempSigma: 0.1, vibMu: 3.8, vibTheta: 0.05, vibSigma: 0.1 },
+	{ id: 'M4', tempMu: 73.6, tempTheta: 0.02, tempSigma: 0.1, vibMu: 2.9, vibTheta: 0.05, vibSigma: 0.1 }
+];
+
+const machineStates: Record<string, { temp: number; vib: number }> = {};
+
+const randomNormal = (mean: number, stdDev: number): number => {
+	let u = 0, v = 0;
+	while (u === 0) u = Math.random();
+	while (v === 0) v = Math.random();
+	const z = Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+	return mean + stdDev * z;
+};
+
+const updateOUProcess = (current: number, mu: number, theta: number, sigma: number): number => {
+	const drift = theta * (mu - current);
+	const diffusion = sigma * randomNormal(0, 1);
+	return current + drift + diffusion;
+};
+
+const getRandomThroughput = (): number => {
+	const r = Math.random();
+	if (r < 0.25) return 3;
+	if (r < 0.50) return 4;
+	if (r < 0.70) return 2;
+	if (r < 0.85) return 5;
+	if (r < 0.95) return 1;
+	return 0;
+};
+
+const getSeededRandom = (seed: number) => {
+	return function() {
+		seed = (seed * 9301 + 49297) % 233280;
+		return seed / 233280;
+	};
+};
+
+const createSeededNormal = (rng: () => number) => {
+	return (mean: number, stdDev: number): number => {
+		let u = 0, v = 0;
+		while (u === 0) u = rng();
+		while (v === 0) v = rng();
+		const z = Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+		return mean + stdDev * z;
+	};
+};
+
+const generateMachineDataPoint = (profile: MachineProfile) => {
+	if (!machineStates[profile.id]) {
+		machineStates[profile.id] = { temp: profile.tempMu, vib: profile.vibMu };
+	}
+	const state = machineStates[profile.id];
+	state.temp = updateOUProcess(state.temp, profile.tempMu, profile.tempTheta, profile.tempSigma);
+	state.vib = updateOUProcess(state.vib, profile.vibMu, profile.vibTheta, profile.vibSigma);
+	return {
+		temp_C: parseFloat(state.temp.toFixed(2)),
+		vibration_mm_s: parseFloat(state.vib.toFixed(2)),
+		status: state.vib >= 4.2 ? 'WARN' : 'OK'
+	};
+};
+
+const getStaticRawData = () => {
+	const pointsPerMachine = 30000;
+	const numMachines = 3;
+	const startTimeUnix = Date.parse('2025-02-12T10:00:00.000Z');
+	const rng = getSeededRandom(987654);
+	const seededNormal = createSeededNormal(rng);
+	const rawData = [
+		{ timestamps: new Float64Array(pointsPerMachine), temperatures: new Float32Array(pointsPerMachine) },
+		{ timestamps: new Float64Array(pointsPerMachine), temperatures: new Float32Array(pointsPerMachine) },
+		{ timestamps: new Float64Array(pointsPerMachine), temperatures: new Float32Array(pointsPerMachine) }
+	];
+	const mus = [71.6, 75.6, 78.6];
+	for (let m = 0; m < numMachines; m++) {
+		let temp = mus[m];
+		for (let i = 0; i < pointsPerMachine; i++) {
+			rawData[m].timestamps[i] = startTimeUnix + i * 10;
+			temp += 0.02 * (mus[m] - temp) + 0.1 * seededNormal(0, 1);
+			rawData[m].temperatures[i] = Number(temp.toFixed(2));
+		}
+	}
+	return { rawData, pointsPerMachine };
+};
+
+const getRealtimeRawData = () => {
+	const pointsPerMachine = 30000;
+	const numMachines = 3;
+	const startTimeUnix = Date.parse('2025-02-12T10:00:00.000Z');
+	const rng = getSeededRandom(123456);
+	const seededNormal = createSeededNormal(rng);
+	const rawData = [
+		{ timestamps: new Float64Array(pointsPerMachine), vibrations: new Float32Array(pointsPerMachine) },
+		{ timestamps: new Float64Array(pointsPerMachine), vibrations: new Float32Array(pointsPerMachine) },
+		{ timestamps: new Float64Array(pointsPerMachine), vibrations: new Float32Array(pointsPerMachine) }
+	];
+	const mus = [2.5, 3.2, 3.8];
+	const noiseLevels = [0.15, 0.20, 0.30];
+	for (let m = 0; m < numMachines; m++) {
+		let state = mus[m];
+		for (let i = 0; i < pointsPerMachine; i++) {
+			rawData[m].timestamps[i] = startTimeUnix + i * 10;
+            
+			state += 0.02 * (mus[m] - state) + 0.15 * seededNormal(0, 1);
+			const finalVib = state + noiseLevels[m] * seededNormal(0, 1);
+            
+			rawData[m].vibrations[i] = Number(Math.max(0.1, finalVib).toFixed(2));
+		}
+	}
+	return { rawData, pointsPerMachine };
+};
+
+// Scenario data generators
+const generateBubbleData = (): SensorData[][] => {
+	const data: SensorData[] = [];
+	const pointsPerMachine = 6000; 
+	for (let i = 0; i < pointsPerMachine; i++) {
+		MACHINE_PROFILES.forEach(profile => {
+			const point = generateMachineDataPoint(profile);
+			data.push({
+				machineId: profile.id,
+				temperature: point.temp_C,
+				vibration: point.vibration_mm_s,
+				throughput: getRandomThroughput() || 1
+			});
+		});
+	}
+	return [
+		data.filter(item => item.machineId === 'M1'),
+		data.filter(item => item.machineId === 'M2'),
+		data.filter(item => item.machineId === 'M3'),
+		data.filter(item => item.machineId === 'M4'),
+	];
+};
+
+const generateMultiStaticData = (): SensorData[][] => {
+	const { rawData, pointsPerMachine } = getStaticRawData();
+	const result: SensorData[][] = [[], [], []];
+	const machineIds = ['M1', 'M2', 'M3'];
+	for (let m = 0; m < 3; m++) {
+		for (let i = 0; i < pointsPerMachine; i++) {
+			result[m].push({
+				timestamp: new Date(rawData[m].timestamps[i]).toISOString(),
+				machineId: machineIds[m],
+				temperature: rawData[m].temperatures[i]
+			});
+		}
+	}
+	return result;
+};
+
+const generateMultiStaticBinaryData = (): MultiStaticBinaryData => {
+	const { rawData, pointsPerMachine } = getStaticRawData();
+	const buffer = new ArrayBuffer(pointsPerMachine * 8 + pointsPerMachine * 12);
+	const sharedTimestamps = new Float64Array(buffer, 0, pointsPerMachine);
+	const tempM1 = new Float32Array(buffer, pointsPerMachine * 8, pointsPerMachine);
+	const tempM2 = new Float32Array(buffer, pointsPerMachine * 8 + pointsPerMachine * 4, pointsPerMachine);
+	const tempM3 = new Float32Array(buffer, pointsPerMachine * 8 + pointsPerMachine * 8, pointsPerMachine);
+	for (let i = 0; i < pointsPerMachine; i++) {
+		sharedTimestamps[i] = rawData[0].timestamps[i];
+		tempM1[i] = rawData[0].temperatures[i];
+		tempM2[i] = rawData[1].temperatures[i];
+		tempM3[i] = rawData[2].temperatures[i];
+	}
+	return { arrayBuffer: buffer, pointsCount: pointsPerMachine };
+};
+
+const generateSyncedChartsData = (): SensorData[] => {
+	const data: SensorData[] = [];
+	const startTimeUnix = Date.parse('2025-02-12T10:00:00.000Z');
+	const profile = MACHINE_PROFILES[0]; 
+	const pointsPerMachine = 6000;
+	for (let i = 0; i < pointsPerMachine; i++) {
+		const timestamp = startTimeUnix + i * 10;
+		const point = generateMachineDataPoint(profile);
+		data.push({
+			timestamp: new Date(timestamp).toISOString(),
+			machineId: profile.id,
+			temperature: point.temp_C,
+			vibration: point.vibration_mm_s,
+			throughput: getRandomThroughput() || 1
+		});
+	}   
+	return data;
+};
+
+const generateAxisSwitchingData = (): SensorData[] => {
+	const data: SensorData[] = [];
+	const pointsPerMachine = 501; 
+	const rng = getSeededRandom(12345);
+	const seededNormal = createSeededNormal(rng);
+	for (let i = 0; i < pointsPerMachine; i++) {
+		const relativeTime = i * 10;
+		let simulatedVib = seededNormal(2.2, 0.8);
+		simulatedVib = Math.max(0.1, Math.min(simulatedVib, 4.5));
+		const stress = Math.max(0.1, Math.pow(simulatedVib, 2));
+		data.push({ machineId: 'M1', relativeTime, stress });
+	}
+	return data;
+};
+
+const generateMultiRealtimeData = (): SensorData[][] => {
+	const { rawData, pointsPerMachine } = getRealtimeRawData();
+	const result: SensorData[][] = [[], [], []];
+	const machineIds = ['M1', 'M2', 'M3'];
+	for (let m = 0; m < 3; m++) {
+		for (let i = 0; i < pointsPerMachine; i++) {
+			result[m].push({
+				timestamp: rawData[m].timestamps[i],
+				machineId: machineIds[m],
+				vibration: rawData[m].vibrations[i]
+			});
+		}
+	}
+	return result;
+};
+
+const generateMultiRealtimeBinaryData = (): RealtimeBinaryData[] => {
+	const { rawData } = getRealtimeRawData();
+	const result = [];
+	for (let m = 0; m < 3; m++) {
+		result.push({
+			timestamps: rawData[m].timestamps,
+			vibrations: rawData[m].vibrations
+		});
+	}
+	return result;
+};
+
+// Main function
+export const getMockData = (scenario: Scenario): GeneratedMockData => {
+	// Check if data for this scenario has already been created
+	if (typeof window !== 'undefined') {
+		if (!window.__SHARED_MOCK_CACHE__) {
+			window.__SHARED_MOCK_CACHE__ = {};
+		}
+		const cache = window.__SHARED_MOCK_CACHE__;
+		if (cache[scenario.id]) {
+			return cache[scenario.id];
+		}
+	}
+	let generatedData: GeneratedMockData;
+	switch (scenario.id) {
+	case 'bubble-static':
+		generatedData = generateBubbleData();
+		break;
+	case 'multi-static':
+		generatedData = generateMultiStaticData();
+		break;
+	case 'multi-static-binary':
+		generatedData = generateMultiStaticBinaryData();
+		break;
+	case 'synced-charts':
+		generatedData = generateSyncedChartsData();
+		break;
+	case 'axis-switching':
+		generatedData = generateAxisSwitchingData();
+		break;
+	case 'multi-realtime':
+		generatedData = generateMultiRealtimeData();
+		break;
+	case 'multi-realtime-binary':
+		generatedData = generateMultiRealtimeBinaryData();
+		break;
+	default:
+		console.warn(`No mock data generator defined for scenario: ${scenario.id}`);
+		generatedData = [];
+	}
+	// Save generated data to cache
+	if (typeof window !== 'undefined' && window.__SHARED_MOCK_CACHE__) {
+		window.__SHARED_MOCK_CACHE__[scenario.id] = generatedData;
+	}
+	return generatedData;
+};
+```
+
+### File: shared\src\vite-env.d.ts
+```ts
+interface ImportMetaEnv {
+  readonly MODE: string;
+  readonly DEV: boolean;
+  readonly PROD: boolean;
+  readonly VITE_LCJS_LICENSE: string;
+}
+
+interface ImportMeta {
+  readonly env: ImportMetaEnv;
+}
+```
+
+### File: frameworks\react\src\LC.tsx
+```tsx
+// React logic for managing LightningChart JS instances that are shared between any LCJS based components that can be visible at the same time.
+// In simple use cases with 1-2 charts visible at once, there is no need to use these.
+// However, with more charts visible at once, this gives an incredible performance advantage, since all charts use a shared LC context.
+// See documentation for more info: 
+// https://lightningchart.com/js-charts/docs/frameworks/react/#optimizing-apps-with-several-charts-visible-at-once--charts-being-initialized-often
+
+import { createContext, useEffect, useRef, useState, PropsWithChildren, } from "react";
+import { LightningChart, lightningChart } from "@lightningchart/lcjs";
+
+// eslint-disable-next-line react-refresh/only-export-components
+export const LCContext = createContext<undefined | LightningChart>(undefined);
+
+export function LCHost(props: PropsWithChildren) {
+	const lcRef = useRef<undefined | LightningChart>(undefined);
+	const [lcState, setLcState] = useState<undefined | LightningChart>(undefined);
+
+	useEffect(() => {
+		if (!lcRef.current) {
+			try {
+				lcRef.current = lightningChart({
+					license: import.meta.env.VITE_LCJS_LICENSE,
+					licenseInformation: {
+						appTitle: "LightningChart JS Trial",
+						company: "LightningChart Ltd.",
+					},
+					sharedContextOptions: {
+						useIndividualCanvas: true,
+					},
+				});
+				setLcState(lcRef.current);
+			} catch (e) {
+				console.error(e);
+			}
+		}
+
+		return () => {
+			if (lcRef.current && "dispose" in lcRef.current) {
+				lcRef.current.dispose();
+				lcRef.current = undefined;
+				setLcState(undefined);
+			}
+		};
+	}, []);
+
+	return (
+		<>
+			<LCContext.Provider value={lcState}>{props.children}</LCContext.Provider>
+		</>
+	);
+}
+```
+
+### File: frameworks\react\src\react-wrapper.tsx
+```tsx
+import { createRoot, Root } from "react-dom/client";
+import { LCHost } from "./LC.tsx";
+import { SCENARIOS, Scenario } from "shared";
+
+const scenarioModules = import.meta.glob('./scenarios/*.tsx', { eager: true });
+
+class ReactScenarioElement extends HTMLElement {
+	private root: Root | null = null;
+
+	connectedCallback() {
+		// Read the tags from HTML element's attributes (created in the shell app)
+		const theme = this.getAttribute("theme") ?? "darkGold";
+		const scenarioId = this.getAttribute("scenario-id");
+		const scenario = SCENARIOS.find(s => s.id === scenarioId);
+		let Component: React.FC<{ activeScenario: Scenario, theme: string }> | null = null;
+		if (scenario) {
+			const path = `./scenarios/${scenario.fileName}.tsx`;
+			// Get the right module from Vite's Library
+			const module = scenarioModules[path] as Record<string, React.FC>;
+			if (module) {
+				// Exported component from the scenario file
+				Component = Object.values(module)[0] as React.FC<{ activeScenario: Scenario, theme: string }>;
+			}
+		}
+		const shadow = this.attachShadow({ mode: "open" });
+		const container = document.createElement("div");
+		container.style.width = "100%";
+		container.style.height = "100%";
+		shadow.appendChild(container);
+		this.root = createRoot(container);
+		if (Component && scenario) {
+			this.root.render(
+				<LCHost>
+					<Component activeScenario={scenario} theme={theme} />
+				</LCHost>
+			);
+		} else {
+			this.root.render(
+				<div>Failed loading scenario: {scenarioId}</div>
+			);
+		}
+	}
+	disconnectedCallback() {
+		if (this.root) {
+			this.root.unmount();
+			this.root = null;
+		}
+	}
+}
+if (!customElements.get("react-scenario")) {
+	customElements.define("react-scenario", ReactScenarioElement);
+}
+```
+
+### File: frameworks\react\src\scenarios\axis-switching.tsx
+```tsx
+import { useEffect, useRef, useContext, useState, useMemo } from "react";
+import { Themes, ChartXY, PointLineAreaSeries, DataSetXY, AxisTickStrategies, Axis } from "@lightningchart/lcjs";
+import { LCContext } from "../LC";
+import { getMockData, isLocalMode, Scenario, SensorData } from "shared";
+
+export function AxisSwitching({ activeScenario, theme }: { activeScenario: Scenario, theme: keyof typeof Themes }) {
+	// LCContext is a React context that you can use for sharing LightningChart resources between all charts that are created during the application lifetime.
+	// More about LCContext: https://lightningchart.com/js-charts/docs/frameworks/react/#optimizing-apps-with-several-charts-visible-at-once--charts-being-initialized-often
+	const lc = useContext(LCContext);
+	const chartRef = useRef<HTMLDivElement>(null);
+	const buttonRef = useRef<HTMLButtonElement | null>(null);
+	const chartElementsRef = useRef<{
+        chart: ChartXY;
+        linSeries: PointLineAreaSeries;
+        logSeries: PointLineAreaSeries;
+        xAxis: Axis;
+        linAxis: Axis;
+        logAxis: Axis;
+    } | null>(null);
+	const [isLog, setIsLog] = useState(false);
+	// Shared data set
+	const dataSet = useMemo(() => {
+		return new DataSetXY({
+			schema: {
+				relativeTime: { pattern: 'progressive' },
+				stress: { pattern: null },
+			}
+		});
+	}, []);
+
+	useEffect(() => {
+		const chartContainer = chartRef.current;
+		if (!chartContainer || !lc) return;
+		const chart = lc.ChartXY({
+			legend: { visible: false },
+			container: chartContainer,
+			theme: Themes[theme],
+		})
+		    .setTitle('');
+		const xAxis = chart.getDefaultAxisX().setTitle('Time').setTickStrategy(AxisTickStrategies.Time);
+		const linAxis = chart.getDefaultAxisY().setTitle('Kinetic Energy (lin)');
+		const logAxis = chart.addAxisY({ type: 'logarithmic', base: 10 }).setTitle('Kinetic Energy (log10)');
+		const linSeries = chart.addLineSeries({ axisX: xAxis, axisY: linAxis, automaticColorIndex: 0 }).setName(`Linear Series`);
+		const logSeries = chart.addLineSeries({ axisX: xAxis, axisY: logAxis, automaticColorIndex: 0 }).setName(`Logarithmic Series`);
+		logSeries.setVisible(false);
+		logAxis.setVisible(false);
+		chartElementsRef.current = { chart, linSeries, logSeries, xAxis, linAxis, logAxis };
+		let isActive = true;
+
+		const setupData = async () => {
+			try {
+				let data: SensorData[][] = [];
+				if (isLocalMode()) {
+					const res = await fetch(`/api/scenarios/${activeScenario.fileName}`);
+					data = await res.json();
+				} else {
+					data = getMockData(activeScenario) as SensorData[][];
+				}
+				if (!isActive || chart.isDisposed()) return;
+				dataSet.clear();
+				dataSet.appendJSON(data, { whitelist: ['relativeTime', 'stress'] });
+				linSeries.setDataSet(dataSet, { x: 'relativeTime', y: 'stress' });
+				logSeries.setDataSet(dataSet, { x: 'relativeTime', y: 'stress' });				
+			} catch (err) {
+				console.error("Failed to fetch data:", err);
+				return;
+			}
+		};
+		setupData();
+
+		return () => {
+			isActive = false; 
+			chart.dispose();
+		};
+	}, [lc, activeScenario, theme, dataSet]);
+
+	useEffect(() => {
+		const chartElements = chartElementsRef.current;
+		if (!chartElements) return;
+		const { linSeries, logSeries, xAxis, linAxis, logAxis } = chartElements;
+		if (isLog) {
+			linSeries.setVisible(false);
+			linAxis.setVisible(false);
+			logSeries.setVisible(true);
+			logAxis.setVisible(true);
+			logAxis.fit();
+			xAxis.fit();
+		} else {
+			linSeries.setVisible(true);
+			linAxis.setVisible(true);
+			logSeries.setVisible(false);
+			logAxis.setVisible(false);
+			linAxis.fit();
+			xAxis.fit();
+		}
+	}, [isLog]);
+
+	return (
+		<div style={{ width: "100%", height: "100%", display: "flex", flexDirection: "column" }}>
+			<div style={{ width: "100%", display: "grid", gridTemplateColumns: "1fr auto auto", alignItems: "center", gap: "16px", padding: "8px 0px"}}>
+				<span style={{ marginLeft: "8px" }}>
+				Kinetic Energy Distribution of Machine Vibration (v<sup>2</sup>) Over a 5-Second Interval
+				</span>
+				<span>Toggle axis type:</span>
+				<button ref={buttonRef} style={{ marginRight: "8px" }} onClick={() => setIsLog((prev) => !prev)}>
+					{isLog ? 'Logarithmic' : 'Linear'}
+				</button>
+			</div>
+			<div ref={chartRef} style={{ width: "100%", flexGrow: "1", minHeight: "0" }}></div>
+		</div>
+	);
+};
+```
+
+### File: frameworks\react\src\scenarios\basic-chart-component.tsx
+```tsx
+import { useEffect, useRef, useContext } from "react";
+import { Themes, ChartXY } from "@lightningchart/lcjs";
+import { LCContext } from "../LC";
+import { Scenario } from "shared";
+
+export function BasicChartComponent({ activeScenario, theme }: { activeScenario: Scenario, theme: keyof typeof Themes }) {
+	// LCContext is a React context that you can use for sharing LightningChart resources between all charts that are created during the application lifetime.
+	// More about LCContext: https://lightningchart.com/js-charts/docs/frameworks/react/#optimizing-apps-with-several-charts-visible-at-once--charts-being-initialized-often
+	const lc = useContext(LCContext);
+	const chartRef = useRef<HTMLDivElement>(null);
+
+	useEffect(() => {
+		const container = chartRef.current;
+		if (!container || !lc) return;
+		const chart: ChartXY = lc.ChartXY({
+			container,
+			theme: Themes[theme],
+		})
+			.setTitle(`React: ${activeScenario.label}`);
+		const points= [];
+		for (let i = 0; i < 20; i++) {
+			points.push({
+				x: i,
+				y: i
+			})
+		}
+		chart.addPointSeries({
+			schema: {
+				x: { pattern: 'progressive' },
+				y: { pattern: null }
+			}
+		})
+			.appendJSON(points);
+		return () => {
+			chart.dispose();
+		};
+	}, [lc, activeScenario, theme]);
+	return <div ref={chartRef} style={{ width: "100%", height: "100%" }}></div>;
+};
+```
+
+### File: frameworks\react\src\scenarios\bubble-static.tsx
+```tsx
+import { useEffect, useContext, useRef } from "react";
+import { Themes, ChartXY, PointLineAreaSeries, isHitSampleXY } from "@lightningchart/lcjs";
+import { LCContext } from "../LC";
+import { isLocalMode, getMockData, Scenario, SensorData } from "shared";
+
+export function BubbleStatic({ activeScenario, theme }: { activeScenario: Scenario, theme: keyof typeof Themes }) {
+	// LCContext is a React context that you can use for sharing LightningChart resources between all charts that are created during the application lifetime.
+	// More about LCContext: https://lightningchart.com/js-charts/docs/frameworks/react/#optimizing-apps-with-several-charts-visible-at-once--charts-being-initialized-often
+	const lc = useContext(LCContext);
+	const chartRef = useRef<HTMLDivElement>(null);
+
+	useEffect(() => {
+		const container = chartRef.current;
+		if (!container || !lc) return
+		const chart: ChartXY = lc.ChartXY({
+			container,
+			theme: Themes[theme],
+		})
+			.setTitle('Temperature and Vibration by Throughput')
+			.setCursorMode('show-nearest');
+		chart.axisX.setTitle('Temperature (°C)');
+		chart.axisY.setTitle('Vibration (mm/s)');
+		const allSeries: PointLineAreaSeries[] = [];
+		for (let i = 0; i < 4; i += 1) {
+			const series = chart.addPointSeries({
+				schema: {
+					temperature: { pattern: null },
+					vibration: { pattern: null },
+					throughput: { pattern: null },
+					machineId: { nonNumeric: true }
+				}
+			})
+				.setName(`Machine ${i + 1}`)
+				.setDataMapping({ x: 'temperature', y: 'vibration', size: 'throughput' });
+			allSeries.push(series);
+		};
+		let isActive = true;
+        
+		const setupData = async () => {
+			try {
+				let data: SensorData[][] = [];
+				if (isLocalMode()) {
+					const res = await fetch(`/api/scenarios/${activeScenario.fileName}`);
+					data = await res.json();
+				} else {
+					data = getMockData(activeScenario) as SensorData[][];
+				}
+				if (!isActive || chart.isDisposed()) return;       
+                
+				for (let i = 0; i < allSeries.length; i++) {
+					allSeries[i]
+						.appendJSON(data[i], { whitelist: ['machineId', 'temperature', 'vibration', 'throughput'] });
+				};
+				chart.setCursorFormatting((_, hit) => {
+					if (!isHitSampleXY(hit)) return undefined
+					return [
+						[{ text: 'Temperature (°C)', font: { weight: 'bold' } }, '', hit.x.toFixed(2)],
+						[{ text: 'Vibration (mm/s)', font: { weight: 'bold' } }, '', hit.y.toFixed(2)],
+						[{ text: 'Throughput', font: { weight: 'bold' } }, '', hit.size?.toFixed(0)]
+					]
+				});
+			} catch (err) {
+				console.error("Failed to fetch data:", err);
+				return;
+			}
+		};
+		setupData();
+        
+		return () => {
+			isActive = false;
+			chart.dispose();
+		};
+	}, [lc, activeScenario, theme]);
+
+	return <div ref={chartRef} style={{ width: "100%", height: "100%" }}></div>;
+}
+```
+
+### File: frameworks\react\src\scenarios\multi-realtime-binary.tsx
+```tsx
+import { useEffect, useContext, useRef } from "react";
+import { Themes, ChartXY, PointLineAreaSeries, AxisTickStrategies, AxisScrollStrategies, ColorRGBA, LUT, PalettedFill, SolidLine } from "@lightningchart/lcjs";
+import { LCContext } from "../LC";
+import { isLocalMode, getMockData, Scenario, RealtimeBinaryData } from "shared";
+
+export function MultiRealtimeBinary({ activeScenario, theme }: { activeScenario: Scenario, theme: keyof typeof Themes }) {
+	// LCContext is a React context that you can use for sharing LightningChart resources between all charts that are created during the application lifetime.
+	// More about LCContext: https://lightningchart.com/js-charts/docs/frameworks/react/#optimizing-apps-with-several-charts-visible-at-once--charts-being-initialized-often
+	const lc = useContext(LCContext);
+	const chartRef = useRef<HTMLDivElement>(null);
+
+	useEffect(() => {
+		const container = chartRef.current;
+		if (!container || !lc) return   
+		const chart: ChartXY = lc.ChartXY({
+			defaultAxisX: { type: 'linear-highPrecision' },
+			legend: { visible: false },
+			container,
+			theme: Themes[theme],
+		})
+			.setTitle('Real-Time Vibration Profile (M1-M3)');
+		chart.getDefaultAxisX()
+			.setTitle("Time")
+			.setTickStrategy(AxisTickStrategies.DateTime)
+			.setScrollStrategy(AxisScrollStrategies.scrolling)
+    		.setDefaultInterval((state) => ({ end: state.dataMax, start: (state.dataMax ?? 0) - 10 * 1000, stopAxisAfter: false }))
+		chart.getDefaultAxisY().dispose()
+        
+		const palette = new PalettedFill({
+			lookUpProperty: 'y',
+			lut: new LUT({
+				interpolate: false,
+				steps: [
+					{ value: 0, color: ColorRGBA( 255, 0, 0 ) },
+					{ value: 0.2, color: ColorRGBA( 0, 255, 0 ) },
+					{ value: 4.2, color: ColorRGBA( 255, 0, 0 ) }
+				],
+			})
+		})
+	
+		const allSeries: PointLineAreaSeries[] = [];
+		for (let i = 0; i < 3; i++) {
+			const axisY = chart
+				.addAxisY({ iStack: -i })
+				.setTitleRotation(0)
+				.setMargins(i === 1 ? 15 : 0, i === 1 ? 15 : 0);
+			if (i === 1) axisY.setTitle('Vibration (mm/s)').setTitleRotation(270);
+			const series = chart.addLineSeries({ 
+				axisY, 
+				schema: {
+					timestamps: { storage: Float64Array, pattern: 'progressive' },
+					vibrations: { storage: Float32Array },
+				}
+			})
+				.setName(`Machine ${i+1}`)
+			    // Data cleaning: set the maximum number of samples that are retained
+				.setMaxSampleCount(50_000)
+				.setDataMapping({ x: 'timestamps', y: 'vibrations' })
+				.setStrokeStyle(new SolidLine({ fillStyle: palette}));
+			allSeries.push(series);
+		}
+		let ws: WebSocket | null = null;
+		let interval: ReturnType<typeof setInterval> | null = null;
+
+		if (isLocalMode()) {
+			ws = new WebSocket(`ws://localhost:3000/api/scenarios/${activeScenario.fileName}`);
+			ws.binaryType = "arraybuffer";
+			ws.onmessage = (e) => {
+				try {
+					const buffer = e.data as ArrayBuffer;
+					const view = new DataView(buffer);
+					const machineIndex = view.getUint8(0);
+					const pointCount = (buffer.byteLength - 8) / 12;
+					const timestamps = new Float64Array(buffer, 8, pointCount);
+					const vibrations = new Float32Array(buffer, 8 + pointCount * 8, pointCount);
+					allSeries[machineIndex].appendSamples({ 
+						timestamps: timestamps, 
+						vibrations: vibrations 
+					});
+				} catch (e) { 
+					console.error(e); 
+				}
+			};
+		} else {
+			const data = getMockData(activeScenario) as RealtimeBinaryData[];
+			let currentIndex = 0;
+			const tempTimestamps = new Float64Array(1);
+			const tempVibrations = new Float32Array(1);
+
+			interval = setInterval(() => {
+				if (currentIndex >= data[0].timestamps.length) {
+					if (interval) clearInterval(interval);
+					return;
+				}
+				for (let i = 0; i < allSeries.length; i++) {
+					const machineData = data[i];
+					tempTimestamps[0] = machineData.timestamps[currentIndex];
+					tempVibrations[0] = machineData.vibrations[currentIndex];
+					allSeries[i].appendSamples({
+						timestamps: tempTimestamps,
+						vibrations: tempVibrations
+					});
+				}
+				currentIndex++;
+			}, 20);
+		}
+
+		return () => {
+			if (ws) ws.close();
+			if (interval) clearInterval(interval);
+			chart.dispose();
+		};
+	}, [lc, activeScenario, theme]);
+
+	return <div ref={chartRef} style={{ width: "100%", height: "100%" }}></div>;
+}
+```
+
+### File: frameworks\react\src\scenarios\multi-realtime.tsx
+```tsx
+import { useEffect, useContext, useRef } from "react";
+import { Themes, ChartXY, PointLineAreaSeries, AxisTickStrategies, AxisScrollStrategies, PalettedFill, LUT, ColorRGBA, SolidLine } from "@lightningchart/lcjs";
+import { LCContext } from "../LC";
+import { isLocalMode, getMockData, SensorData, Scenario } from "shared";
+
+export function MultiRealtime({ activeScenario, theme }: { activeScenario: Scenario, theme: keyof typeof Themes }) {
+	// LCContext is a React context that you can use for sharing LightningChart resources between all charts that are created during the application lifetime.
+	// More about LCContext: https://lightningchart.com/js-charts/docs/frameworks/react/#optimizing-apps-with-several-charts-visible-at-once--charts-being-initialized-often
+	const lc = useContext(LCContext);
+	const chartRef = useRef<HTMLDivElement>(null);
+
+	useEffect(() => {
+		const container = chartRef.current;
+		if (!container || !lc || !activeScenario) return;   
+		const chart: ChartXY = lc.ChartXY({
+			defaultAxisX: { type: 'linear-highPrecision' },
+			legend: { visible: false },
+			container,
+			theme: Themes[theme],
+		})
+			.setTitle('Real-Time Vibration Profile (M1-M3)');
+		chart.getDefaultAxisX()
+			.setTitle("Time")
+			.setTickStrategy(AxisTickStrategies.DateTime)
+      		.setScrollStrategy(AxisScrollStrategies.scrolling)
+    		.setDefaultInterval((state) => ({ end: state.dataMax, start: (state.dataMax ?? 0) - 10 * 1000, stopAxisAfter: false }));
+		chart.getDefaultAxisY().dispose();
+
+		const palette = new PalettedFill({
+			lookUpProperty: 'y',
+			lut: new LUT({
+				interpolate: false,
+				steps: [
+					{ value: 0, color: ColorRGBA( 255, 0, 0 ) },
+					{ value: 0.2, color: ColorRGBA( 0, 255, 0 ) },
+					{ value: 4.2, color: ColorRGBA( 255, 0, 0 ) }
+				],
+			})
+		});
+		
+		const allSeries: PointLineAreaSeries[] = [];
+		for (let i = 0; i < 3; i++) {
+        	const axisY = chart
+				.addAxisY({ iStack: -i })
+				.setMargins(i === 1 ? 15 : 0, i === 1 ? 15 : 0);
+			if (i === 1) axisY.setTitle('Vibration (mm/s)').setTitleRotation(270);
+			const series = chart.addLineSeries({ 
+				axisY, 
+				schema: {
+					timestamp: { pattern: 'progressive' },
+					vibration: { pattern: null },
+					machineId: { nonNumeric: true }
+				} 
+			})
+				.setName(`Machine ${i+1}`)
+				// Data cleaning: set the maximum number of samples that are retained
+				.setMaxSampleCount(50_000)
+				.setDataMapping({ x: 'timestamp', y: 'vibration' })
+				.setStrokeStyle(new SolidLine({ fillStyle: palette}));
+			allSeries.push(series);
+		}
+		let ws: WebSocket | null = null;
+		let interval: ReturnType<typeof setInterval> | null = null;
+
+		if (isLocalMode()) {
+			ws = new WebSocket(`ws://localhost:3000/api/scenarios/${activeScenario.fileName}`);
+			ws.onmessage = (e) => {
+				try {
+					const msg = JSON.parse(e.data);
+					for (let i = 0; i < allSeries.length; i++) {
+						allSeries[i].appendJSON(msg[i]);
+					};
+				} catch (e) { 
+					console.error(e); 
+				}
+			};
+		} else {
+			const data = getMockData(activeScenario) as SensorData[][];
+			let dataAmount = 0;
+			interval = setInterval(() => {
+				if (dataAmount >= data[0].length) {
+					if (interval) clearInterval(interval);
+					return;
+				}
+				for (let i = 0; i < allSeries.length; i++) {
+					allSeries[i].appendJSON([{
+						timestamp: data[i][dataAmount].timestamp,
+						vibration: data[i][dataAmount].vibration,
+						machineId: data[i][dataAmount].machineId
+					}]);
+				}
+				dataAmount++;
+			}, 20);
+		}
+		return () => {
+			if (ws) ws.close();
+			if (interval) clearInterval(interval);
+			chart.dispose();
+		};
+	}, [lc, activeScenario, theme]);
+
+	return <div ref={chartRef} style={{ width: "100%", height: "100%" }}></div>;
+}
+```
+
+### File: frameworks\react\src\scenarios\multi-static-binary.tsx
+```tsx
+import { useEffect, useContext, useRef } from "react";
+import { Themes, ChartXY, PointLineAreaSeries, AxisTickStrategies } from "@lightningchart/lcjs";
+import { LCContext } from "../LC";
+import { isLocalMode, getMockData, Scenario, MultiStaticBinaryData } from "shared";
+
+export function MultiStaticBinary({ activeScenario, theme }: { activeScenario: Scenario, theme: keyof typeof Themes }) {
+	// LCContext is a React context that you can use for sharing LightningChart resources between all charts that are created during the application lifetime.
+	// More about LCContext: https://lightningchart.com/js-charts/docs/frameworks/react/#optimizing-apps-with-several-charts-visible-at-once--charts-being-initialized-often
+	const lc = useContext(LCContext);
+	const chartRef = useRef<HTMLDivElement>(null);
+	useEffect(() => {
+		const container = chartRef.current;
+		if (!container || !lc) return   
+		const chart: ChartXY = lc.ChartXY({
+			defaultAxisX: { type: 'linear-highPrecision', },
+			container,
+			theme: Themes[theme],
+		})
+			.setTitle('Comparative Thermal Analysis of Production Units');
+		chart.getDefaultAxisX().setTickStrategy(AxisTickStrategies.DateTime).setTitle('Time');
+		const axisY = chart.getDefaultAxisY().setTitle('Temperature (°C)');
+		const allSeries: PointLineAreaSeries[] = [];
+		for (let i = 0; i < 3; i++) {
+			const series = chart.addLineSeries({ 
+				axisY,
+				schema: {
+					x: { storage: Float64Array, pattern: 'progressive' },
+					y: { storage: Float32Array }
+				} 
+			});
+			series.setName(`Machine ${i+1}`);
+			allSeries.push(series);
+		}
+		let isActive = true;
+
+		const setupData = async () => {
+			try {
+				let arrayBuffer: ArrayBuffer;
+				let pointsCount: number;
+				if (isLocalMode()) {
+					const res = await fetch(`/api/scenarios/${activeScenario.fileName}`);
+					// Parse custom header to get point counts
+					const pointsCountHeader = res.headers.get('Points-Count');
+					arrayBuffer = await res.arrayBuffer();
+					pointsCount = pointsCountHeader ? parseInt(pointsCountHeader, 10) : arrayBuffer.byteLength / 20;
+				} else {
+					const data = getMockData(activeScenario) as MultiStaticBinaryData;
+					arrayBuffer = data.arrayBuffer;
+					pointsCount = data.pointsCount;
+				}
+				if (!isActive || chart.isDisposed()) return;
+				const sharedTimestamps = new Float64Array(arrayBuffer, 0, pointsCount);
+				const baseTemperatureByteOffset = pointsCount * 8;
+
+				for (let i = 0; i < 3; i++) {
+					const machineByteOffset = baseTemperatureByteOffset + (i * pointsCount * 4);
+					const temperatures = new Float32Array(arrayBuffer, machineByteOffset, pointsCount);
+                
+					allSeries[i].appendSamples({
+						x: sharedTimestamps,
+						y: temperatures,
+					});
+				}
+			} catch (error) {
+				console.error("Data fetch failed:", error);
+				return;
+			}
+		};
+		setupData();
+
+		return () => {
+			isActive = false; 
+			chart.dispose();
+		};
+	}, [lc, activeScenario, theme]);
+
+	return <div ref={chartRef} style={{ width: "100%", height: "100%" }}></div>;
+}
+```
+
+### File: frameworks\react\src\scenarios\multi-static.tsx
+```tsx
+import { useEffect, useContext, useRef } from "react";
+import { Themes, ChartXY, PointLineAreaSeries, AxisTickStrategies } from "@lightningchart/lcjs";
+import { LCContext } from "../LC";
+import { isLocalMode, getMockData, Scenario, SensorData } from "shared";
+
+export function MultiStatic({ activeScenario, theme }: { activeScenario: Scenario, theme: keyof typeof Themes }) {
+	// LCContext is a React context that you can use for sharing LightningChart resources between all charts that are created during the application lifetime.
+	// More about LCContext: https://lightningchart.com/js-charts/docs/frameworks/react/#optimizing-apps-with-several-charts-visible-at-once--charts-being-initialized-often
+	const lc = useContext(LCContext);
+	const chartRef = useRef<HTMLDivElement>(null);
+
+	useEffect(() => {
+		const container = chartRef.current;
+		if (!container || !lc) return;   
+		const chart: ChartXY = lc.ChartXY({
+			defaultAxisX: { type: 'linear-highPrecision' },
+			container,
+			theme: Themes[theme],
+		})
+			.setTitle('Comparative Thermal Analysis of Production Units');
+		chart.getDefaultAxisX().setTickStrategy(AxisTickStrategies.DateTime).setTitle('Time');
+		const axisY = chart.getDefaultAxisY().setTitle('Temperature (°C)');
+
+		const allSeries: PointLineAreaSeries[] = [];
+		for (let i = 0; i < 3; i++) {
+			const series = chart.addLineSeries({ 
+				axisY, 
+				schema: {
+					timestamp: { pattern: 'progressive' },
+					temperature: { pattern: null },
+					machineId: { nonNumeric: true }
+				} 
+			})
+			series.setName(`Machine ${i+1}`).setDataMapping({ x: 'timestamp', y: 'temperature' });
+			allSeries.push(series);
+		};
+		let isActive = true;
+
+		const setupData = async () => {
+			try {
+			    let data: SensorData[][] = [];
+				if (isLocalMode()) {
+					const res = await fetch(`/api/scenarios/${activeScenario.fileName}`);
+					data = await res.json();
+				} else {
+					data = getMockData(activeScenario) as SensorData[][];
+				}
+				if (!isActive || chart.isDisposed()) return;
+                
+				for (let i = 0; i < allSeries.length; i++) {
+					allSeries[i].appendJSON(data[i]);
+				};
+			} catch (err) {
+				console.error("Data fetch failed:", err);
+				return;
+			}
+		};
+		setupData();
+
+		return () => {
+			isActive = false; 
+			chart.dispose();
+		};
+	}, [lc, activeScenario, theme]);
+
+	return <div ref={chartRef} style={{ width: "100%", height: "100%" }}></div>;
+}
+```
+
+### File: frameworks\react\src\scenarios\synced-charts.tsx
+```tsx
+import { useEffect, useContext, useState, useRef, useMemo } from "react";
+import { Themes, ChartXY, CursorXY, PointLineAreaSeries, AxisTickStrategies, synchronizeAxisIntervals, DataSetXY } from "@lightningchart/lcjs";
+import { LCContext } from "../LC";
+import { isLocalMode, getMockData, Scenario, SensorData } from "shared";
+
+const VALUES: string[] = ['temperature', 'vibration', 'throughput'];
+const TITLES: string[] = ['Thermal Output Profile (°C)', 'Mechanical Kinematics Profile (mm/s)', 'Production Throughput Efficiency (units/s)'];
+
+export function SyncedCharts({ activeScenario, theme }: { activeScenario: Scenario, theme: keyof typeof Themes }) {
+	// LCContext is a React context that you can use for sharing LightningChart resources between all charts that are created during the application lifetime.
+	// More about LCContext: https://lightningchart.com/js-charts/docs/frameworks/react/#optimizing-apps-with-several-charts-visible-at-once--charts-being-initialized-often
+	const lc = useContext(LCContext);
+	const chartRef1 = useRef<HTMLDivElement>(null);
+	const chartRef2 = useRef<HTMLDivElement>(null);
+	const chartRef3 = useRef<HTMLDivElement>(null);
+	const [panelData, setPanelData] = useState<{ temp: string, vib: string, tp: string } | null>(null);
+	// Shared data set
+	const dataSet = useMemo(() => {
+		return new DataSetXY({
+			schema: {
+				timestamp: { pattern: 'progressive' },
+				temperature: { pattern: null },
+				vibration: { pattern: null },
+				throughput: { pattern: null }
+			}
+		});
+	}, []);
+
+	useEffect(() => {
+		const containers = [chartRef1.current, chartRef2.current, chartRef3.current];		
+		if (containers.some(c => !c) || !lc) return;
+
+		const charts = containers.map((container, i) => {
+			const chart: ChartXY = lc.ChartXY({
+				defaultAxisX: { type: 'linear-highPrecision' },
+				theme: Themes[theme],
+				container: container as HTMLDivElement,
+			})
+				.setTitle(`${TITLES[i]}`)
+				.setCursorMode(undefined);
+			chart.getDefaultAxisX().setTickStrategy(AxisTickStrategies.DateTime);
+			const series = chart.addLineSeries().setName(`${VALUES[i]}`);
+			const cursor: CursorXY = chart.addCursor();
+			cursor.setTickMarkerXVisible(false);
+			return { chart, cursor, series };
+		})
+		synchronizeAxisIntervals(...charts.map((chart) => chart.chart.axisX));
+
+		const hideCursor = () => {
+			charts.forEach((chart) => chart.cursor.setVisible(false))
+		};
+		const displayCursorAt = (x: number) => {
+			charts.forEach((chart) => {
+				const solveResults = chart.chart
+					.getSeries()
+				    // NOTE: Other series types don't currently have direct API syntax to solve nearest from axis coordinate - for them, you have to first translate axis coordinate to client coordinate and then use solve nearest
+					.map((series) => series.getCursorEnabled() && series instanceof PointLineAreaSeries && series.solveNearest({ x, y: 0 }))
+					.filter((solve) => !!solve);
+				if (solveResults.length > 0) {
+					chart.cursor
+						.setVisible(true)
+						.setPosition(...solveResults.map((solve) => solve.cursorPosition))
+						.setResultTable((rt) => rt.setContent(chart.chart.getCursorFormatting()(chart.chart, solveResults[0], solveResults)));
+				} else {
+					chart.cursor.setVisible(false);
+				}
+			});
+		};
+		charts.forEach((chart) => {
+			chart.chart.seriesBackground.addEventListener('pointermove', (event) =>
+				displayCursorAt(chart.chart.translateCoordinate(event, chart.chart.coordsAxis).x),
+			);
+			chart.chart.getSeries().forEach((series) => series.addEventListener('pointermove', (_event, info) => displayCursorAt(info.x)));
+			chart.chart.seriesBackground.addEventListener('pointerleave', () => hideCursor());
+		});
+		let isActive = true;
+
+		const setupData = async () => {
+			try {
+				let data: SensorData[][] = [];
+				if (isLocalMode()) {
+					const res = await fetch(`/api/scenarios/${activeScenario.fileName}`);
+					data = await res.json();
+				} else {
+					data = getMockData(activeScenario) as SensorData[][];
+				}
+				if (!isActive) return;
+                
+				dataSet.clear();
+				dataSet.appendJSON(data, { whitelist: ['timestamp', VALUES[0], VALUES[1], VALUES[2]] });
+				for (let i = 0; i < charts.length; i++) {
+					charts[i].series.setDataSet(dataSet, { x: 'timestamp', y: VALUES[i] });
+				}; 
+				const countAverage = (property: string) => {
+					const array = dataSet.readBack().data[property];
+					let total = 0;
+					for (let i = 0; i < array.length; i++) {
+						total += array[i];
+					}
+					return total / array.length;
+				}
+				setPanelData({
+					temp: countAverage(VALUES[0]).toFixed(2),
+					vib: countAverage(VALUES[1]).toFixed(2),
+					tp: (countAverage(VALUES[2]) * 100).toFixed(0)
+				});
+			} catch (err) {
+				console.error("Failed to fetch data:", err);
+				return;
+			}
+		};
+		setupData();
+
+		return () => {
+			isActive = false; 
+			charts.forEach(chart => chart.chart.dispose());
+		};
+	}, [activeScenario, dataSet, lc, theme]);
+
+	return (
+		<div style={{ width: "100%", height: "100%", display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gridTemplateRows: "repeat(2, 1fr)" }}>
+			<div style={{ padding: "8px" }}>
+				{panelData ? (
+					<>
+						<strong>Synchronized Multivariate Production Telemetry</strong><br />
+						<br />
+						Production unit: <strong>Machine 1</strong><br />
+                        Average temperature: <strong>{panelData.temp}</strong> °C<br />
+                        Average vibration: <strong>{panelData.vib}</strong> mm/s<br />
+                        Average throughput: <strong>{panelData.tp}</strong> units per second
+					</>
+				) : (
+					"Loading data..."
+				)}
+			</div>
+			<div ref={chartRef1} style={{ width: "100%", height: "100%" }}></div>
+			<div ref={chartRef2} style={{ width: "100%", height: "100%" }}></div>
+			<div ref={chartRef3} style={{ width: "100%", height: "100%" }}></div>
+		</div>
+	);
+}
+```
+
+### File: frameworks\react\src\vite-env.d.ts
+```ts
+/// <reference types="vite/client" />
+
+interface ImportMetaEnv {
+  readonly VITE_LCJS_LICENSE: string;
+}
+
+interface ImportMeta {
+  readonly env: ImportMetaEnv;
+}
+```
+
+### File: frameworks\vue\src\scenarios\axis-switching.vue
+```html
+<template>
+	<div style="width: 100%; height: 100%; display: flex; flex-direction: column;">
+		<div style="width: 100%; display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 16px; padding: 8px 0px;">
+			<span style="margin-left: 8px;">Kinetic Energy Distribution of Machine Vibration (v<sup>2</sup>) Over a 5-Second Interval</span>
+			<span>Toggle axis type:</span>
+			<button style="margin-right: 8px;" @click="toggleAxis">
+				{{ isLog ? 'Logarithmic' : 'Linear' }}
+			</button>
+		</div>
+		<div ref="chartRef" style="width: 100%; flex-grow: 1; min-height: 0;" />
+	</div>
+</template>
+
+<script lang="ts">
+import { ref, shallowRef, onMounted, PropType, onBeforeUnmount, onErrorCaptured } from 'vue'
+import { lightningChart, Themes, PointLineAreaSeries, Axis, AxisTickStrategies, DataSetXY } from "@lightningchart/lcjs";
+import { isLocalMode, getMockData, Scenario, SensorData } from "shared";
+
+export default {
+	name: "AxisSwitching",
+	props: {
+		activeScenario: { type: Object as PropType<Scenario>, required: true },
+		theme: { type: Object as PropType<keyof typeof Themes>, required: true }
+	},
+	setup(props) {
+		const chartRef = ref<HTMLDivElement | null>(null);
+		const lc = shallowRef();
+		const chart = shallowRef();
+		const xAxis = shallowRef<Axis>();
+		const linAxis = shallowRef<Axis>();
+		const logAxis = shallowRef<Axis>();
+		const linSeries = shallowRef<PointLineAreaSeries>();
+		const logSeries = shallowRef<PointLineAreaSeries>();
+		const isLog = ref(false);
+		const dataSet = new DataSetXY({
+			schema: {
+				relativeTime: { pattern: 'progressive' },
+				stress: { pattern: null },
+			}
+		});
+
+		const createChart = () => {
+			lc.value = lightningChart({ license: import.meta.env.VITE_LCJS_LICENSE, });
+			chart.value = lc.value.ChartXY({
+				legend: { visible: false },
+				container: chartRef.value,
+				theme: Themes[props.theme],
+			})
+				.setTitle('');;
+			if (!chart.value) return;
+
+			xAxis.value = chart.value.getDefaultAxisX().setTitle('Time').setTickStrategy(AxisTickStrategies.Time);
+			linAxis.value = chart.value.getDefaultAxisY().setTitle('Kinetic Energy (lin)');
+			logAxis.value = chart.value.addAxisY({ type: 'logarithmic', base: 10 }).setTitle('Kinetic Energy (log10)');
+			if (!xAxis.value || !linAxis.value || !logAxis.value) return;
+			linSeries.value = chart.value.addLineSeries({ axisX: xAxis.value, axisY: linAxis.value, automaticColorIndex: 0 }).setName(`Linear Series`);
+			logSeries.value = chart.value.addLineSeries({ axisX: xAxis.value, axisY: logAxis.value, automaticColorIndex: 0 }).setName(`Logarithmic Series`);
+			logSeries.value.setVisible(false);
+			logAxis.value.setVisible(false);
+		}
+		const setupData = async () => {
+			if (!chart.value || !props.activeScenario) return;
+			try {
+				let data: SensorData[][] = [];
+				if (isLocalMode()) {
+					const res = await fetch(`/api/scenarios/${props.activeScenario.fileName}`);
+					data = await res.json();
+				} else {
+					data = getMockData(props.activeScenario);
+				}
+				dataSet.clear();
+				dataSet.appendJSON(data, { whitelist: ['relativeTime', 'stress'] });			
+				if (linSeries.value && logSeries.value) { 
+					linSeries.value.setDataSet(dataSet, { x: 'relativeTime', y: 'stress' });
+					logSeries.value.setDataSet(dataSet, { x: 'relativeTime', y: 'stress' });
+				}
+			} catch (err) {
+				console.error("Failed to fetch data:", err);
+				return;
+			}
+		};
+		const toggleAxis = () => {
+			isLog.value = !isLog.value;
+			if (!linSeries.value || !logSeries.value || !linAxis.value || !logAxis.value || !xAxis.value) return;
+			if (isLog.value) {
+				linSeries.value.setVisible(false);
+				linAxis.value.setVisible(false);
+				logSeries.value.setVisible(true);
+				logAxis.value.setVisible(true);
+				logAxis.value.fit();
+				xAxis.value.fit();
+			} else {
+				linSeries.value.setVisible(true);
+				linAxis.value.setVisible(true);
+				logSeries.value.setVisible(false);
+				logAxis.value.setVisible(false);
+				linAxis.value.fit();
+				xAxis.value.fit();
+			}
+		}
+		onMounted(() => {
+			createChart();	
+			setupData();
+		})
+		onBeforeUnmount(() => {
+			if (lc.value) lc.value.dispose();
+		})
+		onErrorCaptured((err, _vm, info) => {
+			console.error(`Error captured in component: ${info}`, err);
+		})
+		return {
+			chartRef,
+			isLog,
+			toggleAxis
+		};
+	}
+};
+</script>
+```
+
+### File: frameworks\vue\src\scenarios\basic-chart-component.vue
+```html
+<template>
+	<div ref="chartRef" style="width: 100%; height: 100%;" />
+</template>
+
+<script lang="ts">
+import { ref, shallowRef, onMounted, PropType, onBeforeUnmount, onErrorCaptured } from 'vue'
+import { lightningChart, Themes } from "@lightningchart/lcjs";
+import { Scenario } from "shared";
+
+export default {
+	name: "BasicChartComponent",
+	props: {
+		activeScenario: { type: Object as PropType<Scenario>, required: true },
+		theme: { type: Object as PropType<keyof typeof Themes>, required: true }
+	},
+	setup(props) {
+		const chartRef = ref<HTMLDivElement | null>(null);
+		const lc = shallowRef();
+		const chart = shallowRef();
+
+		const createChart = () => {
+			lc.value = lightningChart({ license: import.meta.env.VITE_LCJS_LICENSE, });
+			chart.value = lc.value.ChartXY({
+				container: chartRef.value,
+				theme: Themes[props.theme],
+			});
+			if (!chartRef.value || !chart.value || !props.activeScenario) return;
+			chart.value.setTitle(`Vue: ${props.activeScenario.label}`);
+		}
+		const setupData = () => {
+			if (!chart.value || !props.activeScenario) return;
+			const points= []
+			for (let i = 0; i < 20; i++) {
+				points.push({
+					x: i,
+					y: i
+				})
+			}
+			chart.value.addPointSeries({
+				schema: {
+					x: { pattern: 'progressive' },
+					y: { pattern: null }
+				}
+			})
+				.appendJSON(points);
+		}
+		onMounted(() => {
+			createChart();		
+			setupData();
+		})
+		onBeforeUnmount(() => {
+			if (lc.value) lc.value.dispose();
+		})
+		onErrorCaptured((err, _vm, info) => {
+			console.error(`Error captured in component: ${info}`, err);
+		})
+		return {
+			chartRef,
+		};
+	}
+};
+</script>
+```
+
+### File: frameworks\vue\src\scenarios\bubble-static.vue
+```html
+<template>
+	<div ref="chartRef" style="width: 100%; height: 100%;" />
+</template>
+
+<script lang="ts">
+import { ref, shallowRef, onMounted, onBeforeUnmount, onErrorCaptured, PropType } from 'vue'
+import { lightningChart, Themes, ChartXY, PointLineAreaSeries, isHitSampleXY } from "@lightningchart/lcjs";
+import { isLocalMode, getMockData, Scenario, SensorData } from "shared";
+
+export default {
+	name: "BubbleStatic",
+	props: {
+		activeScenario: { type: Object as PropType<Scenario>, required: true },
+		theme: { type: Object as PropType<keyof typeof Themes>, required: true }
+	},
+	setup(props) {
+		const chartRef = ref<HTMLDivElement | null>(null);
+		const lc = shallowRef();
+		const chart = shallowRef<ChartXY | undefined>();
+		const allSeries = ref<PointLineAreaSeries[]>([]);
+
+		const createChart = () => {
+			lc.value = lightningChart({ license: import.meta.env.VITE_LCJS_LICENSE, });
+			chart.value = lc.value.ChartXY({
+				container: chartRef.value,
+				theme: Themes[props.theme],
+			});
+			if (!chartRef.value || !chart.value || !props.activeScenario) return;
+			chart.value
+				.setTitle('Temperature and Vibration by Throughput')
+				.setCursorMode('show-nearest');
+			chart.value.axisX.setTitle('Temperature (°C)');
+			chart.value.axisY.setTitle('Vibration (mm/s)');
+
+			for (let i = 0; i < 4; i ++) {
+				const series = chart.value.addPointSeries({
+					schema: {
+						temperature: { pattern: null },
+						vibration: { pattern: null },
+						throughput: { pattern: null },
+						machineId: { nonNumeric: true }
+					}
+				})
+					.setName(`Machine ${i + 1}`)
+					.setDataMapping({ x: 'temperature', y: 'vibration', size: 'throughput' });
+				allSeries.value[i] = series;
+			};
+		}
+		const setupData = () => {
+			if (!chart.value || !props.activeScenario) return;
+			try {
+				if (isLocalMode()) {
+					fetch(`/api/scenarios/${props.activeScenario.fileName}`)
+						.then(res => res.json())
+						.then(data => {	
+							for (let i = 0; i < allSeries.value.length; i++) {
+								allSeries.value[i].appendJSON(data[i], { whitelist: ['machineId', 'temperature', 'vibration', 'throughput'] });
+							};
+						})
+						.catch(err => console.log(err.message))
+				} else {
+					const data = getMockData(props.activeScenario) as SensorData[][];
+					for (let i = 0; i < allSeries.value.length; i += 1) {
+						allSeries.value[i].appendJSON(data[i]);
+					};
+				}
+				chart.value.setCursorFormatting((_, hit) => {
+					if (!isHitSampleXY(hit)) return undefined
+					return [
+						[{ text: 'Temperature (°C)', font: { weight: 'bold' } }, '', hit.x.toFixed(2)],
+						[{ text: 'Vibration (mm/s)', font: { weight: 'bold' } }, '', hit.y.toFixed(2)],
+						[{ text: 'Throughput', font: { weight: 'bold' } }, '', hit.size?.toFixed(0)]
+					]
+				});
+			} catch (err) {
+				console.error("Failed to fetch data:", err);
+				return;
+			}
+		}
+		onMounted(() => {
+			createChart();			
+			setupData();
+		})
+		onBeforeUnmount(() => {
+			if (lc.value) lc.value.dispose();
+		})
+		onErrorCaptured((err, _vm, info) => {
+			console.error(`Error captured in component: ${info}`, err);
+		})
+		return {
+			chartRef,
+		};
+	}
+};
+</script>
+```
+
+### File: frameworks\vue\src\scenarios\multi-realtime-binary.vue
+```html
+<template>
+	<div ref="chartRef" style="width: 100%; height: 100%;" />
+</template>
+
+<script lang="ts">
+import { ref, shallowRef, onMounted, PropType, onBeforeUnmount, onErrorCaptured } from 'vue'
+import { lightningChart, Themes, PointLineAreaSeries, AxisTickStrategies, AxisScrollStrategies, PalettedFill, LUT, SolidLine, ColorRGBA } from "@lightningchart/lcjs";
+import { isLocalMode, getMockData, Scenario } from "shared";
+
+export default {
+	name: "MultiRealtimeBinary",
+	props: {
+		activeScenario: { type: Object as PropType<Scenario>, required: true },
+		theme: { type: Object as PropType<keyof typeof Themes>, required: true }
+	},
+	setup(props) {
+		const chartRef = ref<HTMLDivElement | null>(null);
+		const lc = shallowRef();
+		const chart = shallowRef();
+		const allSeries = ref<PointLineAreaSeries[]>([]);
+		const ws = ref<WebSocket | undefined>();
+		let interval: ReturnType<typeof setInterval> | null = null;
+
+		const createChart = () => {
+			lc.value = lightningChart({ license: import.meta.env.VITE_LCJS_LICENSE, });
+			chart.value = lc.value.ChartXY({
+				defaultAxisX: { type: 'linear-highPrecision' },
+				legend: { visible: false },
+				container: chartRef.value,
+				theme: Themes[props.theme],
+			});
+			if (!chartRef.value || !chart.value || !props.activeScenario) return;
+			chart.value.setTitle('Real-Time Vibration Profile (M1-M3)');
+			chart.value.getDefaultAxisX()
+				.setTitle("Time")
+				.setTickStrategy(AxisTickStrategies.DateTime)
+				.setScrollStrategy(AxisScrollStrategies.scrolling)
+				.setDefaultInterval((state: { curStart: number; curEnd: number; dataMin: number | undefined; dataMax: number | undefined;}) => (
+					{ end: state.dataMax, start: (state.dataMax ?? 0) - 10 * 1000, stopAxisAfter: false }
+				));
+			chart.value.getDefaultAxisY().dispose();
+
+			const palette = new PalettedFill({
+				lookUpProperty: 'y',
+				lut: new LUT({
+					interpolate: false,
+					steps: [
+						{ value: 0, color: ColorRGBA( 255, 0, 0 ) },
+						{ value: 0.2, color: ColorRGBA( 0, 255, 0 ) },
+						{ value: 4.2, color: ColorRGBA( 255, 0, 0 ) }
+					],
+				})
+			});
+
+			for (let i = 0; i < 3; i += 1) {
+				const axisY = chart.value
+					.addAxisY({ iStack: -i })
+					.setTitleRotation(0)
+					.setMargins(i === 1 ? 15 : 0, i === 1 ? 15 : 0);
+				if (i === 1) axisY.setTitle('Vibration (mm/s)').setTitleRotation(270);
+				const series = chart.value.addLineSeries({ 
+					axisY, 
+					schema: {
+						timestamps: { storage: Float64Array, pattern: 'progressive' },
+						vibrations: { storage: Float32Array },
+					} 
+				})
+					.setName(`Machine ${i+1}`)
+					// Data cleaning: set the maximum number of samples that are retained
+					.setMaxSampleCount(50_000)
+					.setDataMapping({ x: 'timestamps', y: 'vibrations' })
+					.setStrokeStyle(new SolidLine({ fillStyle: palette}));
+				allSeries.value[i] = series;
+			};
+		}
+		const setupData = () => {
+			if (!chart.value || !props.activeScenario) return;
+			if (isLocalMode()) {
+				ws.value = new WebSocket(`ws://localhost:3000/api/scenarios/${props.activeScenario.fileName}`);
+				ws.value.binaryType = "arraybuffer";
+				if (!ws.value) return;
+				ws.value.onmessage = (e) => {
+					try {
+						const buffer = e.data as ArrayBuffer;
+						const view = new DataView(buffer);
+						const machineIndex = view.getUint8(0);
+						const pointCount = (buffer.byteLength - 8) / 12;
+						const timestamps = new Float64Array(buffer, 8, pointCount);
+						const vibrations = new Float32Array(buffer, 8 + pointCount * 8, pointCount);
+						allSeries.value[machineIndex].appendSamples({ 
+							timestamps: timestamps, 
+							vibrations: vibrations 
+						});
+					} catch (e) { 
+						console.error(e); 
+					}
+				};
+			} else {
+				const data = getMockData(props.activeScenario);			
+				let currentIndex = 0;
+				const tempTimestamps = new Float64Array(1);
+				const tempVibrations = new Float32Array(1);
+
+				interval = setInterval(() => {
+					if (currentIndex >= data[0].timestamps.length) {
+						if (interval) clearInterval(interval);
+						return;
+					}
+					for (let i = 0; i < allSeries.value.length; i++) {
+						const machineData = data[i];
+						tempTimestamps[0] = machineData.timestamps[currentIndex];
+						tempVibrations[0] = machineData.vibrations[currentIndex];
+						allSeries.value[i].appendSamples({
+							timestamps: tempTimestamps,
+							vibrations: tempVibrations
+						});
+					}
+					currentIndex++;
+				}, 20);
+			}			
+		}
+		onMounted(() => {
+			createChart();		
+			setupData();
+		})
+		onBeforeUnmount(() => {
+			if (lc.value) lc.value.dispose();
+			if (ws.value) ws.value.close();
+			if (interval) clearInterval(interval);
+		})
+		onErrorCaptured((err, _vm, info) => {
+			console.error(`Error captured in component: ${info}`, err);
+		})
+		return {
+			chartRef,
+		};
+	}
+};
+</script>
+```
+
+### File: frameworks\vue\src\scenarios\multi-realtime.vue
+```html
+<template>
+	<div ref="chartRef" style="width: 100%; height: 100%;" />
+</template>
+
+<script lang="ts">
+import { ref, shallowRef, onMounted, PropType, onBeforeUnmount, onErrorCaptured } from 'vue'
+import { lightningChart, Themes, PointLineAreaSeries, AxisTickStrategies, AxisScrollStrategies, SolidLine, ColorRGBA, LUT, PalettedFill } from "@lightningchart/lcjs";
+import { isLocalMode, getMockData, Scenario, SensorData } from "shared";
+
+export default {
+	name: "MultiRealtime",
+	props: {
+		activeScenario: { type: Object as PropType<Scenario>, required: true },
+		theme: { type: Object as PropType<keyof typeof Themes>, required: true }
+	},
+	setup(props) {
+		const chartRef = ref<HTMLDivElement | null>(null);
+		const lc = shallowRef();
+		const chart = shallowRef();
+		const allSeries = ref<PointLineAreaSeries[]>([]);
+		const ws = ref<WebSocket | undefined>();
+		let interval: ReturnType<typeof setInterval> | null = null;
+
+		const createChart = () => {
+			lc.value = lightningChart({ license: import.meta.env.VITE_LCJS_LICENSE, });
+			chart.value = lc.value.ChartXY({
+				defaultAxisX: { type: 'linear-highPrecision' },
+				legend: { visible: false },
+				container: chartRef.value,
+				theme: Themes[props.theme],
+			});
+			if (!chartRef.value || !chart.value || !props.activeScenario) return;
+			chart.value.setTitle('Real-Time Vibration Profile (M1-M3)');
+			chart.value.getDefaultAxisX()
+				.setTitle("Time")
+				.setTickStrategy(AxisTickStrategies.DateTime)
+				.setScrollStrategy(AxisScrollStrategies.scrolling)
+				.setDefaultInterval((state: { curStart: number; curEnd: number; dataMin: number | undefined; dataMax: number | undefined;}) => (
+					{ end: state.dataMax, start: (state.dataMax ?? 0) - 10 * 1000, stopAxisAfter: false }
+				));
+			chart.value.getDefaultAxisY().dispose();
+            
+			const palette = new PalettedFill({
+				lookUpProperty: 'y',
+				lut: new LUT({
+					interpolate: false,
+					steps: [
+						{ value: 0, color: ColorRGBA( 255, 0, 0 ) },
+						{ value: 0.2, color: ColorRGBA( 0, 255, 0 ) },
+						{ value: 4.2, color: ColorRGBA( 255, 0, 0 ) }
+					],
+				})
+			});
+
+			for (let i = 0; i < 3; i += 1) {
+				const axisY = chart.value
+					.addAxisY({ iStack: -i })
+					.setTitleRotation(0)
+					.setMargins(i === 1 ? 15 : 0, i === 1 ? 15 : 0);
+				if (i === 1) axisY.setTitle('Vibration (mm/s)').setTitleRotation(270);
+				const series = chart.value.addLineSeries({ 
+					axisY, 
+					schema: {
+						timestamp: { pattern: 'progressive' },
+						vibration: { pattern: null },
+						machineId: { nonNumeric: true }
+					} 
+				})
+					.setName(`Machine ${i+1}`)
+					// Data cleaning: set the maximum number of samples that are retained
+					.setMaxSampleCount(50_000)
+					.setDataMapping({ x: 'timestamp', y: 'vibration' })
+					.setStrokeStyle(new SolidLine({ fillStyle: palette}));
+				allSeries.value[i] = series;
+			};
+		}
+		const setupData = () => {
+			if (!chart.value || !props.activeScenario) return;
+			if (isLocalMode()) {
+				ws.value = new WebSocket(`ws://localhost:3000/api/scenarios/${props.activeScenario.fileName}`);
+				if (!ws.value) return;
+				ws.value.onmessage = (e) => {
+					try {
+						const msg = JSON.parse(e.data);
+						for (let i = 0; i < allSeries.value.length; i++) {
+							allSeries.value[i].appendJSON(msg[i]);
+						};
+					} catch (e) {
+						console.error(e);
+					}
+				};
+			} else {
+				const data = getMockData(props.activeScenario) as SensorData[][];
+				let dataAmount = 0;
+				interval = setInterval(() => {
+					if (dataAmount >= data[0].length) {
+						if (interval) clearInterval(interval);
+						return;
+					}
+					for (let i = 0; i < allSeries.value.length; i++) {
+						allSeries.value[i].appendJSON([{
+							timestamp: data[i][dataAmount].timestamp,
+							vibration: data[i][dataAmount].vibration,
+							machineId: data[i][dataAmount].machineId
+						}]);
+					}
+					dataAmount++;
+				}, 20);
+			}			
+		}
+		onMounted(() => {
+			createChart();		
+			setupData();
+		})
+		onBeforeUnmount(() => {
+			if (lc.value) lc.value.dispose();
+			if (ws.value) ws.value.close();
+			if (interval) clearInterval(interval);
+		})
+		onErrorCaptured((err, _vm, info) => {
+			console.error(`Error captured in component: ${info}`, err);
+		})
+		return {
+			chartRef,
+		};
+	}
+};
+</script>
+```
+
+### File: frameworks\vue\src\scenarios\multi-static-binary.vue
+```html
+<template>
+	<div ref="chartRef" style="width: 100%; height: 100%;" />
+</template>
+
+<script lang="ts">
+import { ref, shallowRef, onMounted, PropType, onBeforeUnmount, onErrorCaptured } from 'vue'
+import { lightningChart, Themes, PointLineAreaSeries, AxisTickStrategies } from "@lightningchart/lcjs";
+import { isLocalMode, getMockData, Scenario } from "shared";
+
+export default {
+	name: "MultiStaticBinary",
+	props: {
+		activeScenario: { type: Object as PropType<Scenario>, required: true },
+		theme: { type: Object as PropType<keyof typeof Themes>, required: true }
+	},
+	setup(props) {
+		const chartRef = ref<HTMLDivElement | null>(null);
+		const lc = shallowRef();
+		const chart = shallowRef();
+		const allSeries = ref<PointLineAreaSeries[]>([]);
+
+		const createChart = () => {
+			lc.value = lightningChart({ license: import.meta.env.VITE_LCJS_LICENSE, });
+			chart.value = lc.value.ChartXY({
+				defaultAxisX: { type: 'linear-highPrecision' },
+				container: chartRef.value,
+				theme: Themes[props.theme],
+			});
+			if (!chartRef.value || !chart.value || !props.activeScenario) return;
+			chart.value.setTitle('Comparative Thermal Analysis of Production Units');
+			chart.value.getDefaultAxisX().setTickStrategy(AxisTickStrategies.DateTime).setTitle("Time");
+			const axisY = chart.value.getDefaultAxisY().setTitle('Temperature (°C)');
+			for (let i = 0; i < 3; i += 1) {
+				const series = chart.value.addLineSeries({ 
+					axisY, 
+					schema: {
+						x: { storage: Float64Array, pattern: 'progressive' },
+						y: { storage: Float32Array }
+					}
+				})
+				series.setName(`Machine ${i+1}`);
+				allSeries.value[i] = series;
+			};
+		}
+		const setupData = async () => {
+			if (!chart.value || !props.activeScenario) return;
+			try {
+				let arrayBuffer: ArrayBuffer;
+				let pointsCount: number;
+				if (isLocalMode()) {
+					const res = await fetch(`/api/scenarios/${props.activeScenario.fileName}`);
+					// Parse custom header to get point counts
+					const pointsCountHeader = res.headers.get('Points-Count');
+					arrayBuffer = await res.arrayBuffer();
+					pointsCount = pointsCountHeader ? parseInt(pointsCountHeader, 10) : arrayBuffer.byteLength / 20;
+				} else {
+					const data = getMockData(props.activeScenario);
+					arrayBuffer = data.arrayBuffer;
+					pointsCount = data.pointsCount;
+				}
+				if (chart.value.isDisposed()) return;
+				const sharedTimestamps = new Float64Array(arrayBuffer, 0, pointsCount);
+				const baseTemperatureByteOffset = pointsCount * 8;
+
+				for (let i = 0; i < 3; i++) {
+					const machineByteOffset = baseTemperatureByteOffset + (i * pointsCount * 4);
+					const temperatures = new Float32Array(arrayBuffer, machineByteOffset, pointsCount);
+                
+					allSeries.value[i].appendSamples({
+						x: sharedTimestamps,
+						y: temperatures,
+					});
+				}
+			} catch (err) {
+				console.error("Failed to fetch data:", err);
+				return;
+			}
+		}
+		onMounted(() => {
+			createChart();		
+			setupData();
+		})
+		onBeforeUnmount(() => {
+			if (lc.value) lc.value.dispose();
+		})
+		onErrorCaptured((err, _vm, info) => {
+			console.error(`Error captured in component: ${info}`, err);
+		})
+		return {
+			chartRef,
+		};
+	}
+};
+</script>
+```
+
+### File: frameworks\vue\src\scenarios\multi-static.vue
+```html
+<template>
+	<div ref="chartRef" style="width: 100%; height: 100%;" />
+</template>
+
+<script lang="ts">
+import { ref, shallowRef, onMounted, PropType, onBeforeUnmount, onErrorCaptured } from 'vue'
+import { lightningChart, Themes, PointLineAreaSeries, AxisTickStrategies } from "@lightningchart/lcjs";
+import { isLocalMode, getMockData, Scenario, SensorData } from "shared";
+
+export default {
+	name: "MultiStatic",
+	props: {
+		activeScenario: { type: Object as PropType<Scenario>, required: true },
+		theme: { type: Object as PropType<keyof typeof Themes>, required: true }
+	},
+	setup(props) {
+		const chartRef = ref<HTMLDivElement | null>(null);
+		const lc = shallowRef();
+		const chart = shallowRef();
+		const allSeries = ref<PointLineAreaSeries[]>([]);
+
+		const createChart = () => {
+			lc.value = lightningChart({ license: import.meta.env.VITE_LCJS_LICENSE, });
+			chart.value = lc.value.ChartXY({
+				defaultAxisX: { type: 'linear-highPrecision' },
+				container: chartRef.value,
+				theme: Themes[props.theme],
+			});
+			if (!chartRef.value || !chart.value || !props.activeScenario) return;
+			chart.value.setTitle('Comparative Thermal Analysis of Production Units');
+			chart.value.getDefaultAxisX().setTickStrategy(AxisTickStrategies.DateTime).setTitle("Time");
+			const axisY = chart.value.getDefaultAxisY().setTitle('Temperature (°C)');
+			for (let i = 0; i < 3; i += 1) {
+				const series = chart.value.addLineSeries({ 
+					axisY, 
+					schema: {
+						timestamp: { pattern: 'progressive' },
+						temperature: { pattern: null },
+						machineId: { nonNumeric: true }
+					} 
+				})
+				series.setName(`Machine ${i+1}`).setDataMapping({ x: 'timestamp', y: 'temperature' });
+				allSeries.value[i] = series;
+			};
+		}
+		const setupData = async () => {
+			if (!chart.value || !props.activeScenario) return;
+			try {
+				let data: SensorData[][] = [];
+				if (isLocalMode()) {
+					const res = await fetch(`/api/scenarios/${props.activeScenario.fileName}`);
+					data = await res.json();
+				} else {
+					data = await getMockData(props.activeScenario);
+				}	
+				for (let i = 0; i < allSeries.value.length; i++) {
+					allSeries.value[i].appendJSON(data[i]);
+				};
+			} catch (err) {
+				console.error("Failed to fetch data:", err);
+				return;
+			}	
+		}
+		onMounted(() => {
+			createChart();		
+			setupData();
+		})
+		onBeforeUnmount(() => {
+			if (lc.value) lc.value.dispose();
+		})
+		onErrorCaptured((err, _vm, info) => {
+			console.error(`Error captured in component: ${info}`, err);
+		})
+		return {
+			chartRef,
+		};
+	}
+};
+</script>
+```
+
+### File: frameworks\vue\src\scenarios\synced-charts.vue
+```html
+<template>
+	<div style="width: 100%; height: 100%; display: grid; grid-template-columns: repeat(2, 1fr); grid-template-rows: repeat(2, 1fr);">
+		<div style="padding: 8px;">
+			<template v-if="panelData">
+				<strong>Synchronized Multivariate Production Telemetry</strong><br>
+				<br>
+				Production unit: <strong>Machine 1</strong><br>
+				Average temperature: <strong>{{ panelData.temp }}</strong> °C<br>
+				Average vibration: <strong>{{ panelData.vib }}</strong> mm/s<br>
+				Average throughput: <strong>{{ panelData.tp }}</strong> units per second
+			</template>
+			<template v-else>
+				Loading data...
+			</template>
+		</div>
+		<div ref="chartRef1" />
+		<div ref="chartRef2" />
+		<div ref="chartRef3" />
+	</div>
+</template>
+
+<script lang="ts">
+import { ref, shallowRef, onMounted, PropType, onBeforeUnmount, onErrorCaptured } from 'vue'
+import { lightningChart, Themes, ChartXY, CursorXY, PointLineAreaSeries, DataSetXY, AxisTickStrategies, synchronizeAxisIntervals } from "@lightningchart/lcjs";
+import { isLocalMode, getMockData, Scenario, SensorData } from "shared";
+
+export default {
+	name: "SyncedCharts",
+	props: {
+		activeScenario: { type: Object as PropType<Scenario>, required: true },
+		theme: { type: Object as PropType<keyof typeof Themes>, required: true }
+	},
+	setup(props) {
+		const lc = shallowRef();
+		const chartRef1 = shallowRef();
+		const chartRef2 = shallowRef();
+		const chartRef3 = shallowRef();
+		const allCharts = shallowRef<Array<{ chart: ChartXY; cursor: CursorXY; series: PointLineAreaSeries }>>([]);
+		const VALUES: string[] = ['temperature', 'vibration', 'throughput'];
+		const panelData = ref();
+		const dataSet = new DataSetXY({
+			schema: {
+				timestamp: { pattern: 'progressive' },
+				temperature: { pattern: null },
+				vibration: { pattern: null },
+				throughput: { pattern: null }
+			}
+		});
+
+		const createCharts = () => {
+			lc.value = lightningChart({ license: import.meta.env.VITE_LCJS_LICENSE, });
+			const containers = [chartRef1.value, chartRef2.value, chartRef3.value];		
+			if (containers.some(c => !c) || !lc.value) return;
+			allCharts.value = containers.map((container, i) => {
+				const chart: ChartXY = lc.value.ChartXY({
+					defaultAxisX: { type: 'linear-highPrecision' },
+					theme: Themes[props.theme],
+					container: container as HTMLDivElement,
+				})
+					.setTitle('')
+					.setCursorMode(undefined);
+				chart.getDefaultAxisX().setTickStrategy(AxisTickStrategies.DateTime);
+				const series = chart.addLineSeries().setName(`${VALUES[i]}`);
+				const cursor: CursorXY = chart.addCursor();
+				cursor.setTickMarkerXVisible(false);
+				return { chart, cursor, series };
+			})		
+			synchronizeAxisIntervals(...allCharts.value.map((chart) => chart.chart.axisX));
+
+			const hideCursor = () => {
+				allCharts.value.forEach((chart) => chart.cursor.setVisible(false))
+			};
+			const displayCursorAt = (x: number) => {
+				allCharts.value.forEach((chart) => {
+					const solveResults = chart.chart
+						.getSeries()
+						// NOTE: Other series types don't currently have direct API syntax to solve nearest from axis coordinate - for them, you have to first translate axis coordinate to client coordinate and then use solve nearest
+						.map((series) => series.getCursorEnabled() && series instanceof PointLineAreaSeries && series.solveNearest({ x, y: 0 }))
+						.filter((solve) => !!solve);
+					if (solveResults.length > 0) {
+						chart.cursor
+							.setVisible(true)
+							.setPosition(...solveResults.map((solve) => solve.cursorPosition))
+							.setResultTable((rt) => rt.setContent(chart.chart.getCursorFormatting()(chart.chart, solveResults[0], solveResults)));
+					} else {
+						chart.cursor.setVisible(false);
+					}
+				});
+			};
+			allCharts.value.forEach((chart) => {
+				chart.chart.seriesBackground.addEventListener('pointermove', (event) =>
+					displayCursorAt(chart.chart.translateCoordinate(event, chart.chart.coordsAxis).x),
+				);
+				chart.chart.getSeries().forEach((series) => series.addEventListener('pointermove', (_event, info) => displayCursorAt(info.x)));
+				chart.chart.seriesBackground.addEventListener('pointerleave', () => hideCursor());
+			});
+		}
+
+		const setupData = async () => {
+			if (!allCharts.value || !props.activeScenario) return;
+			try {
+				let data: SensorData[][] = [];
+				if (isLocalMode()) {
+					const res = await fetch(`/api/scenarios/${props.activeScenario.fileName}`);
+					data = await res.json();
+				} else {
+					data = getMockData(props.activeScenario);
+				}	
+                
+				dataSet.clear();
+				dataSet.appendJSON(data, { whitelist: ['timestamp', VALUES[0], VALUES[1], VALUES[2]] });
+				for (let i = 0; i < allCharts.value.length; i++) {
+					allCharts.value[i].series.setDataSet(dataSet, { x: 'timestamp', y: VALUES[i] });
+				}; 
+				const countAverage = (property: string) => {
+					const array = dataSet.readBack().data[property]
+					let total = 0
+					for (let i = 0; i < array.length; i++) {
+						total += array[i];
+					}
+					return total / array.length;
+				}
+				panelData.value = { 				
+					temp: countAverage(VALUES[0]).toFixed(2),
+					vib: countAverage(VALUES[1]).toFixed(2),
+					tp: (countAverage(VALUES[2]) * 100).toFixed(0) 
+				};
+			} catch (err) {
+				console.error("Failed to fetch data:", err);
+				return;
+			}	
+		}
+		onMounted(() => {
+			createCharts();		
+			setupData();
+		})
+		onBeforeUnmount(() => {
+			if (lc.value) lc.value.dispose();
+		})
+		onErrorCaptured((err, _vm, info) => {
+			console.error(`Error captured in component: ${info}`, err);
+		})
+		return {
+			chartRef1,
+			chartRef2,
+			chartRef3,
+			panelData
+		};
+	}
+};
+</script>
+```
+
+### File: frameworks\vue\src\vite-env.d.ts
+```ts
+/// <reference types="vite/client" />
+
+interface ImportMetaEnv {
+  readonly VITE_LCJS_LICENSE: string;
+}
+
+interface ImportMeta {
+  readonly env: ImportMetaEnv;
+}
+```
+
+### File: frameworks\vue\src\vue-wrapper.ts
+```ts
+import { createApp, App } from 'vue';
+import { SCENARIOS } from "shared";
+
+const scenarioModules = import.meta.glob('./scenarios/*.vue', { eager: true });
+
+class VueScenarioElement extends HTMLElement {
+	private app: App | null = null;
+
+	connectedCallback() {
+		// Read the tags from HTML element's attributes (created in the shell app)
+		const theme = this.getAttribute("theme") ?? "darkGold";
+		const scenarioId = this.getAttribute("scenario-id");
+		const scenario = SCENARIOS.find(s => s.id === scenarioId);
+		let Component = null;
+		if (scenario) {
+			const path = `./scenarios/${scenario.fileName}.vue`;
+			// Get the right module from Vite's Library
+			const module = scenarioModules[path] as Record<string, unknown>;
+			if (module) {
+				// Vue Single File Components usually export the component as default
+				Component = module.default || Object.values(module)[0];
+			}
+		}
+		const shadow = this.attachShadow({ mode: "open" });
+		const container = document.createElement("div");
+		container.style.width = "100%";
+		container.style.height = "100%";
+		shadow.appendChild(container);
+		if (Component) {
+			// Create a new Vue instance from the scenario component
+			this.app = createApp(Component, { activeScenario: scenario, theme: theme });
+			// Attach the component to the container
+			this.app.mount(container);
+		} else {
+			container.innerHTML = `<div>Failed loading scenario: ${scenarioId}</div>`;
+			console.error(`Vue scenario not found: ${scenarioId}`);
+		}
+	}
+	disconnectedCallback() {
+		if (this.app) {
+			this.app.unmount();
+			this.app = null;
+		}
+	}
+}
+if (!customElements.get("vue-scenario")) {
+	customElements.define("vue-scenario", VueScenarioElement);
+}
+
+```
+
+### File: frameworks\angular\src\angular-wrapper.ts
+```ts
+import 'zone.js';
+import { createApplication } from '@angular/platform-browser';
+import { createComponent, ApplicationRef, ComponentRef } from '@angular/core';
+import { SCENARIOS } from 'shared';
+
+const scenarioModules = import.meta.glob('./scenarios/*.ts', { eager: true });
+class AngularScenarioElement extends HTMLElement {
+	private appRef: ApplicationRef | null = null;
+	private componentRef: ComponentRef<unknown> | null = null;
+
+	async connectedCallback() {
+		// Read the tags from HTML element's attributes (created in the shell app)
+		const theme = this.getAttribute("theme") ?? "darkGold";
+		const scenarioId = this.getAttribute("scenario-id");
+		const scenario = SCENARIOS.find(s => s.id === scenarioId);
+		let ComponentClass = null;
+		if (scenario) {
+			const path = `./scenarios/${scenario.fileName}.ts`;
+			// Get the right module from Vite's Library
+			const module = scenarioModules[path] as Record<string, unknown>;
+			if (module) {
+				// Find first class (Angular components are exported as classes) or default export
+				ComponentClass = module['default'] || Object.values(module)[0];
+			}
+		}
+		const shadow = this.attachShadow({ mode: "open" });
+		const container = document.createElement("div");
+		container.style.width = "100%";
+		container.style.height = "100%";
+		shadow.appendChild(container);
+		if (ComponentClass && scenario) {
+			try {
+				// Create Angular app context
+				this.appRef = await createApplication();
+				// Create component and attach to container
+				this.componentRef = createComponent(ComponentClass, {
+					environmentInjector: this.appRef.injector,
+					hostElement: container
+				});
+				// Pass the parameters
+				this.componentRef.setInput('activeScenario', scenario);
+				this.componentRef.setInput('theme', theme);
+				// Attach component to Angular's Change Detection
+				this.appRef.attachView(this.componentRef.hostView);
+			} catch (error) {
+				console.error(`Failed loading Angular scenario: ${scenarioId}:`, error);
+				container.innerHTML = `<div>Error initializing Angular scenario</div>`;
+			}
+		} else {
+			container.innerHTML = `<div>Failed loading scenario: ${scenarioId}</div>`;
+			console.error(`Angular scenario not found: ${scenarioId}`);
+		}
+	}
+	disconnectedCallback() {
+		if (this.componentRef) {
+			this.componentRef.destroy();
+			this.componentRef = null;
+		}
+		if (this.appRef) {
+			this.appRef.destroy();
+			this.appRef = null;
+		}
+	}
+}
+if (!customElements.get("angular-scenario")) {
+	customElements.define("angular-scenario", AngularScenarioElement);
+}
+```
+
+### File: frameworks\angular\src\lc-context\lc-context.service.spec.ts
+```ts
+import { TestBed } from '@angular/core/testing';
+import { LcContextService } from './lc-context.service';
+import 'jasmine';
+
+describe('LcContextService', () => {
+	let service: LcContextService;
+
+	beforeEach(() => {
+		TestBed.configureTestingModule({});
+		service = TestBed.inject(LcContextService);
+	});
+
+	it('should be created', () => {
+		expect(service).toBeTruthy();
+	});
+});
+```
+
+### File: frameworks\angular\src\lc-context\lc-context.service.ts
+```ts
+import { Injectable } from '@angular/core';
+import { LightningChart, lightningChart } from '@lightningchart/lcjs';
+
+@Injectable({
+	providedIn: 'root',
+})
+export class LcContextService {
+	private lc?: LightningChart;
+
+	constructor() {}
+
+	public getLightningChartContext() {
+		if (this.lc) return this.lc;
+		this.lc = lightningChart({
+			// Place your LCJS license key here
+			// This should originate from a environment variable / secret. In development, license is assigned per developer, whereas in staging/production a deployment license is used.
+			license: import.meta.env.VITE_LCJS_LICENSE,
+		});
+		return this.lc;
+	}
+}
+```
+
+### File: frameworks\angular\src\scenarios\axis-switching.ts
+```ts
+import { afterNextRender, Component, ElementRef, Input, OnDestroy, ViewChild } from '@angular/core';
+import { Themes, PointLineAreaSeries, AxisTickStrategies, Axis, ChartXY, DataSetXY } from "@lightningchart/lcjs";
+import { LcContextService } from '../lc-context/lc-context.service';
+import { isLocalMode, getMockData, Scenario, SensorData } from "shared";
+
+@Component({
+	selector: 'axis-switching',
+	template: `
+        <div style="width: 100%; height: 100%; display: flex; flex-direction: column;">
+            <div style="width: 100%; display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 16px; padding: 8px 0px;">
+                <span style="margin-left: 8px;">Kinetic Energy Distribution of Machine Vibration (v<sup>2</sup>) Over a 5-Second Interval</span>
+                <span>Toggle axis type:</span>
+                <button style="margin-right: 8px;" (click)="toggleAxis()">
+                    {{ isLog ? 'Logarithmic' : 'Linear' }}
+                </button>
+            </div>
+            <div #chartRef style="width: 100%; flex-grow: 1; min-height: 0;"></div>
+        </div>
+    `,
+})
+export class AxisSwitching implements OnDestroy {
+    @ViewChild('chartRef', { static: false }) chartRef!: ElementRef<HTMLDivElement>;
+    @Input({ required: true }) theme!: keyof typeof Themes; 
+    @Input({ required: true }) activeScenario!: Scenario;
+    private destroyLC?: () => void;
+    private chartElements?: {
+        chart: ChartXY;
+        xAxis: Axis;
+        linAxis: Axis;
+        logAxis: Axis;
+        linSeries: PointLineAreaSeries;
+        logSeries: PointLineAreaSeries;
+    };
+    private dataSet = new DataSetXY({
+    	schema: {
+    		relativeTime: { pattern: 'progressive' },
+    		stress: { pattern: null },
+    	}
+    });
+    isLog = false;
+    
+    constructor(lcContextService: LcContextService) {
+    	afterNextRender(() => {
+    		const lc = lcContextService.getLightningChartContext();
+    		const container = this.chartRef.nativeElement;
+    		const chart = lc.ChartXY({ 
+    			legend: { visible: false },
+    			container, 
+    			theme: Themes[this.theme], 
+    		})			
+    			.setTitle('');
+    		const xAxis = chart.getDefaultAxisX().setTitle('Time').setTickStrategy(AxisTickStrategies.Time);
+    		const linAxis = chart.getDefaultAxisY().setTitle('Kinetic Energy (lin)');
+    		const logAxis = chart.addAxisY({ type: 'logarithmic', base: 10 }).setTitle('Kinetic Energy (log10)');
+    		const linSeries = chart.addLineSeries({ axisX: xAxis, axisY: linAxis, automaticColorIndex: 0 }).setName(`Linear Series`);
+    		const logSeries = chart.addLineSeries({ axisX: xAxis, axisY: logAxis, automaticColorIndex: 0 }).setName(`Logarithmic Series`);
+    		logSeries.setVisible(false);
+    		logAxis.setVisible(false);
+    		this.chartElements = { chart, linSeries, logSeries, xAxis, linAxis, logAxis };
+
+    		const setupData = async () => {
+    			try {
+    				let data: SensorData[][] = [];
+    				if (isLocalMode()) {
+    					const res = await fetch(`/api/scenarios/${this.activeScenario.fileName}`);
+    					data = await res.json();
+    				} else {
+    					data = getMockData(this.activeScenario);
+    				}
+    				if (chart.isDisposed()) return;
+                    
+    				this.dataSet.clear();
+    				this.dataSet.appendJSON(data, { whitelist: ['relativeTime', 'stress'] });
+    				linSeries.setDataSet(this.dataSet, { x: 'relativeTime', y: 'stress' });
+    				logSeries.setDataSet(this.dataSet, { x: 'relativeTime', y: 'stress' });
+    			} catch (err) {
+    				console.error("Failed to fetch data:", err);
+    				return;
+    			}
+    		};
+    		setupData();
+                        
+    		this.destroyLC = () => {
+    			chart.dispose();
+    		}    
+    	})
+    };
+    
+    toggleAxis = () => {
+    	this.isLog = !this.isLog;
+    	const chartElements = this.chartElements;
+    	if (!chartElements) return;
+    	const { linSeries, logSeries, xAxis, linAxis, logAxis } = chartElements;
+    	if (this.isLog) {
+    		linSeries.setVisible(false);
+    		linAxis.setVisible(false);
+    		logSeries.setVisible(true);
+    		logAxis.setVisible(true);
+    		logAxis.fit();
+    		xAxis.fit();
+    	} else {
+    		linSeries.setVisible(true);
+    		linAxis.setVisible(true);
+    		logSeries.setVisible(false);
+    		logAxis.setVisible(false);
+    		linAxis.fit();
+    		xAxis.fit();
+    	}
+    };
+    
+    ngOnDestroy(): void {
+    	if (this.destroyLC) {
+    		this.destroyLC();
+    	} 
+    };
+}
+```
+
+### File: frameworks\angular\src\scenarios\basic-chart-component.ts
+```ts
+import { afterNextRender, Component, ElementRef, Input, OnDestroy, ViewChild } from '@angular/core';
+import { Themes } from "@lightningchart/lcjs";
+import { LcContextService } from '../lc-context/lc-context.service';
+import { Scenario } from "shared";
+
+@Component({
+	selector: 'basic-chart-component',
+	template: `<div #chartRef style="width: 100%; height: 100%;"></div>`,
+})
+export class BasicChartComponent implements OnDestroy {
+    @ViewChild('chartRef', { static: false }) chartRef!: ElementRef<HTMLDivElement>;
+    @Input({ required: true }) theme!: keyof typeof Themes; 
+    @Input({ required: true }) activeScenario!: Scenario;
+    private destroyLC?: () => void;
+    
+    constructor(lcContextService: LcContextService) {
+    	afterNextRender(() => {
+    		const lc = lcContextService.getLightningChartContext();
+    		const container = this.chartRef.nativeElement;
+    		const chart = lc.ChartXY({ 
+    			container, 
+    			theme: Themes[this.theme], 
+    		})			
+    			.setTitle(`Angular: ${this.activeScenario.label}`);
+                
+    		const points= [];
+    		for (let i = 0; i < 20; i++) {
+    			points.push({
+    				x: i,
+    				y: i
+    			})
+    		}
+    		chart.addPointSeries({
+    			schema: {
+    				x: { pattern: 'progressive' },
+    				y: { pattern: 'progressive' }
+    			}
+    		})
+    			.appendJSON(points);
+
+    		this.destroyLC = () => {
+    			chart.dispose();
+    		}
+    	})
+    };
+    
+    ngOnDestroy(): void {
+    	if (this.destroyLC) {
+    		this.destroyLC(); 
+    	} 
+    };
+}
+```
+
+### File: frameworks\angular\src\scenarios\bubble-static.ts
+```ts
+import { afterNextRender, Component, ElementRef, Input, OnDestroy, ViewChild } from '@angular/core';
+import { Themes, PointLineAreaSeries, isHitSampleXY } from "@lightningchart/lcjs";
+import { LcContextService } from '../lc-context/lc-context.service';
+import { isLocalMode, getMockData, Scenario, SensorData } from "shared";
+
+@Component({
+	selector: 'bubble-static',
+	template: `<div #chartRef style="width: 100%; height: 100%;"></div>`,
+})
+export class BubbleStatic implements OnDestroy {
+    @ViewChild('chartRef', { static: false }) chartRef!: ElementRef<HTMLDivElement>;
+    @Input({ required: true }) theme!: keyof typeof Themes; 
+    @Input({ required: true }) activeScenario!: Scenario;
+    private destroyLC?: () => void;
+    
+    constructor(lcContextService: LcContextService) {
+    	afterNextRender(() => {
+    		const lc = lcContextService.getLightningChartContext();
+    		const container = this.chartRef.nativeElement;
+    		const chart = lc.ChartXY({ 
+    			container, 
+    			theme: Themes[this.theme], 
+    		})			
+    			.setTitle('Temperature and Vibration by Throughput')
+    			.setCursorMode('show-nearest');
+
+    		chart.axisX.setTitle('Temperature (°C)');
+    		chart.axisY.setTitle('Vibration (mm/s)');
+    		const allSeries: PointLineAreaSeries[] = [];
+    		for (let i = 0; i < 4; i += 1) {
+    			const series = chart.addPointSeries({
+    				schema: {
+    					temperature: { pattern: null },
+    					vibration: { pattern: null },
+    					throughput: { pattern: null },
+    					machineId: { nonNumeric: true }
+    				}
+    			})
+    				.setName(`Machine ${i + 1}`)
+    				.setDataMapping({ x: 'temperature', y: 'vibration', size: 'throughput' });
+    			allSeries.push(series);
+    		};
+
+    		const setupData = async () => {
+    			try {
+    				let data: SensorData[][] = [];
+    				if (isLocalMode()) {
+    					const res = await fetch(`/api/scenarios/${this.activeScenario.fileName}`);
+    					data = await res.json();
+    				} else {
+    					data = getMockData(this.activeScenario);
+    				}
+    				if (chart.isDisposed()) return;    
+                    
+    				for (let i = 0; i < allSeries.length; i++) {
+    					allSeries[i]
+    						.appendJSON(data[i], { whitelist: ['machineId', 'temperature', 'vibration', 'throughput'] });
+    				};
+    				chart.setCursorFormatting((_, hit) => {
+    					if (!isHitSampleXY(hit)) return undefined
+    					return [
+    						[{ text: 'Temperature (°C)', font: { weight: 'bold' } }, '', hit.x.toFixed(2)],
+    						[{ text: 'Vibration (mm/s)', font: { weight: 'bold' } }, '', hit.y.toFixed(2)],
+    						[{ text: 'Throughput', font: { weight: 'bold' } }, '', hit.size?.toFixed(0)]
+    					]
+    				});
+    			} catch (err) {
+    				console.error("Failed to fetch data:", err);
+    				return;
+    			}
+    		};
+    		setupData();
+
+    		this.destroyLC = () => {
+    			chart.dispose();
+    		}
+    	})
+    };
+    
+    ngOnDestroy(): void {
+    	if (this.destroyLC) {
+    		this.destroyLC();
+    	} 
+    };
+}
+```
+
+### File: frameworks\angular\src\scenarios\multi-realtime-binary.ts
+```ts
+import { afterNextRender, Component, ElementRef, Input, OnDestroy, ViewChild } from '@angular/core';
+import { Themes, PointLineAreaSeries, AxisTickStrategies, AxisScrollStrategies, PalettedFill, LUT, ColorRGBA, SolidLine } from "@lightningchart/lcjs";
+import { LcContextService } from '../lc-context/lc-context.service';
+import { isLocalMode, getMockData, Scenario, RealtimeBinaryData } from "shared";
+
+@Component({
+	selector: 'multi-realtime-binary',
+	template: `<div #chartRef style="width: 100%; height: 100%;"></div>`,
+})
+export class MultiRealtimeBinary implements OnDestroy {
+    @ViewChild('chartRef', { static: false }) chartRef!: ElementRef<HTMLDivElement>;
+    @Input({ required: true }) theme!: keyof typeof Themes; 
+    @Input({ required: true }) activeScenario!: Scenario;
+    private destroyLC?: () => void;
+    
+    constructor(lcContextService: LcContextService) {
+    	afterNextRender(() => {
+    		const lc = lcContextService.getLightningChartContext();
+    		const container = this.chartRef.nativeElement;
+    		const chart = lc.ChartXY({ 
+    			defaultAxisX: { type: 'linear-highPrecision', },
+    			legend: { visible: false },
+    			container, 
+    			theme: Themes[this.theme], 
+    		})			
+    			.setTitle('Real-Time Vibration Profile (M1-M3)');
+    		chart.getDefaultAxisX()
+    			.setTitle("Time")
+    			.setTickStrategy(AxisTickStrategies.DateTime)
+    			.setScrollStrategy(AxisScrollStrategies.scrolling)
+    			.setDefaultInterval((state) => ({ end: state.dataMax, start: (state.dataMax ?? 0) - 10 * 1000, stopAxisAfter: false }))
+    		chart.getDefaultAxisY().dispose();
+
+    		const palette = new PalettedFill({
+    			lookUpProperty: 'y',
+    			lut: new LUT({
+    				interpolate: false,
+    				steps: [
+    					{ value: 0, color: ColorRGBA( 255, 0, 0 ) },
+    					{ value: 0.2, color: ColorRGBA( 0, 255, 0 ) },
+    					{ value: 4.2, color: ColorRGBA( 255, 0, 0 ) }
+    				],
+    			})
+    		});
+		
+    		const allSeries: PointLineAreaSeries[] = [];
+    		for (let i = 0; i < 3; i++) {
+    			const axisY = chart
+    				.addAxisY({ iStack: -i })
+    				.setTitleRotation(0)
+    				.setMargins(i === 1 ? 15 : 0, i === 1 ? 15 : 0);
+    			if (i === 1) axisY.setTitle('Vibration (mm/s)').setTitleRotation(270);
+    			const series = chart.addLineSeries({ 
+    				axisY, 
+    				schema: {
+    					timestamps: { storage: Float64Array, pattern: 'progressive' },
+    					vibrations: { storage: Float32Array },
+    				} 
+    			})
+    				.setName(`Machine ${i+1}`)
+    			    // Data cleaning: set the maximum number of samples that are retained
+    				.setMaxSampleCount(50_000)
+    				.setDataMapping({ x: 'timestamps', y: 'vibrations' })
+    				.setStrokeStyle(new SolidLine({ fillStyle: palette}));
+    			allSeries.push(series);
+    		}
+    		let ws: WebSocket | null = null;
+    		let interval: ReturnType<typeof setInterval> | null = null;
+
+    		if (isLocalMode()) {
+    			ws = new WebSocket(`ws://localhost:3000/api/scenarios/${this.activeScenario.fileName}`);
+    			ws.binaryType = "arraybuffer";
+    			ws.onmessage = (e) => {
+    				try {
+    					const buffer = e.data as ArrayBuffer;
+    					const view = new DataView(buffer);
+    					const machineIndex = view.getUint8(0);
+    					const pointCount = (buffer.byteLength - 8) / 12;
+    					const timestamps = new Float64Array(buffer, 8, pointCount);
+    					const vibrations = new Float32Array(buffer, 8 + pointCount * 8, pointCount);
+    					allSeries[machineIndex].appendSamples({ 
+    						timestamps: timestamps, 
+    						vibrations: vibrations 
+    					});
+    				} catch (e) { 
+    					console.error(e); 
+    				}
+    			};
+    		} else {
+    			const data = getMockData(this.activeScenario) as RealtimeBinaryData[];
+    			let currentIndex = 0;
+    			const tempTimestamps = new Float64Array(1);
+    			const tempVibrations = new Float32Array(1);
+
+    			interval = setInterval(() => {
+    				if (currentIndex >= data[0].timestamps.length) {
+    					if (interval) clearInterval(interval);
+    					return;
+    				}
+    				for (let i = 0; i < allSeries.length; i++) {
+    					const machineData = data[i];
+    					tempTimestamps[0] = machineData.timestamps[currentIndex];
+    					tempVibrations[0] = machineData.vibrations[currentIndex];
+    					allSeries[i].appendSamples({
+    						timestamps: tempTimestamps,
+    						vibrations: tempVibrations
+    					});
+    				}
+    				currentIndex++;
+    			}, 20);
+    		}
+
+    		this.destroyLC = () => {
+    			if (ws) ws.close();
+    			if (interval) clearInterval(interval);
+    			chart.dispose();
+    		}
+    	})
+    };
+    
+    ngOnDestroy(): void {
+    	if (this.destroyLC) {
+    		this.destroyLC();
+    	} 
+    };
+}
+```
+
+### File: frameworks\angular\src\scenarios\multi-realtime.ts
+```ts
+import { afterNextRender, Component, ElementRef, Input, OnDestroy, ViewChild } from '@angular/core';
+import { Themes, PointLineAreaSeries, AxisTickStrategies, AxisScrollStrategies, PalettedFill, LUT, ColorRGBA, SolidLine } from "@lightningchart/lcjs";
+import { LcContextService } from '../lc-context/lc-context.service';
+import { isLocalMode, getMockData, Scenario, SensorData } from "shared";
+
+@Component({
+	selector: 'multi-realtime',
+	template: `<div #chartRef style="width: 100%; height: 100%;"></div>`,
+})
+export class MultiRealtime implements OnDestroy {
+    @ViewChild('chartRef', { static: false }) chartRef!: ElementRef<HTMLDivElement>;
+    @Input({ required: true }) theme!: keyof typeof Themes; 
+    @Input({ required: true }) activeScenario!: Scenario;
+    private destroyLC?: () => void;
+    
+    constructor(lcContextService: LcContextService) {
+    	afterNextRender(() => {
+    		const lc = lcContextService.getLightningChartContext();
+    		const container = this.chartRef.nativeElement;
+    		const chart = lc.ChartXY({ 
+    			defaultAxisX: { type: 'linear-highPrecision', },
+    			legend: { visible: false },
+    			container, 
+    			theme: Themes[this.theme], 
+    		})			
+    			.setTitle('Real-Time Vibration Profile (M1-M3)');
+    		chart.getDefaultAxisX()
+    			.setTitle("Time")
+    			.setTickStrategy(AxisTickStrategies.DateTime)
+    			.setScrollStrategy(AxisScrollStrategies.scrolling)
+    		    // Set view to 10 seconds.
+    			.setDefaultInterval((state) => ({ end: state.dataMax, start: (state.dataMax ?? 0) - 10 * 1000, stopAxisAfter: false }))
+    		chart.getDefaultAxisY().dispose();
+
+    		const palette = new PalettedFill({
+    			lookUpProperty: 'y',
+    			lut: new LUT({
+    				interpolate: false,
+    				steps: [
+    					{ value: 0, color: ColorRGBA( 255, 0, 0 ) },
+    					{ value: 0.2, color: ColorRGBA( 0, 255, 0 ) },
+    					{ value: 4.2, color: ColorRGBA( 255, 0, 0 ) }
+    				],
+    			})
+    		});
+		
+    		const allSeries: PointLineAreaSeries[] = [];
+    		for (let i = 0; i < 3; i++) {
+    			const axisY = chart
+    				.addAxisY({ iStack: -i })
+    				.setTitleRotation(0)
+    				.setMargins(i === 1 ? 15 : 0, i === 1 ? 15 : 0);    			
+    			if (i === 1) axisY.setTitle('Vibration (mm/s)').setTitleRotation(270);
+    			const series = chart.addLineSeries({ 
+    				axisY, 
+    				schema: {
+    					timestamp: { pattern: 'progressive' },
+    					vibration: { pattern: null },
+    					machineId: { nonNumeric: true }
+    				} 
+    			})
+    				.setName(`Machine ${i+1}`)
+    			    // Data cleaning: set the maximum number of samples that are retained
+    				.setMaxSampleCount(50_000)
+    				.setDataMapping({ x: 'timestamp', y: 'vibration' })
+    				.setStrokeStyle(new SolidLine({ fillStyle: palette}));
+    			allSeries.push(series);
+    		}
+    		let ws: WebSocket | null = null;
+    		let interval: ReturnType<typeof setInterval> | null = null;
+
+    		if (isLocalMode()) {
+    			ws = new WebSocket(`ws://localhost:3000/api/scenarios/${this.activeScenario.fileName}`);
+    			ws.onmessage = (e) => {
+    				try {
+    					const msg = JSON.parse(e.data);
+    					for (let i = 0; i < allSeries.length; i++) {
+    						allSeries[i].appendJSON(msg[i]);
+    					};
+    				} catch (e) { 
+    					console.error(e); 
+    				}
+    			};
+    		} else {
+    			const data = getMockData(this.activeScenario) as SensorData[][];
+    			let dataAmount = 0;
+    			interval = setInterval(() => {
+    				if (dataAmount >= data[0].length) {
+    					if (interval) clearInterval(interval);
+    					return;
+    				}
+    				for (let i = 0; i < allSeries.length; i++) {
+    					allSeries[i].appendJSON([{
+    						timestamp: data[i][dataAmount].timestamp,
+    						vibration: data[i][dataAmount].vibration,
+    						machineId: data[i][dataAmount].machineId
+    					}]);
+    				}
+    				dataAmount++;
+    			}, 20);
+    		}
+
+    		this.destroyLC = () => {
+    			if (ws) ws.close();
+    			if (interval) clearInterval(interval);
+    			chart.dispose();
+    		}
+    	})
+    };
+    
+    ngOnDestroy(): void {
+    	if (this.destroyLC) {
+    		this.destroyLC();
+    	} 
+    };
+}
+```
+
+### File: frameworks\angular\src\scenarios\multi-static-binary.ts
+```ts
+import { afterNextRender, Component, ElementRef, Input, OnDestroy, ViewChild } from '@angular/core';
+import { Themes, PointLineAreaSeries, AxisTickStrategies } from "@lightningchart/lcjs";
+import { LcContextService } from '../lc-context/lc-context.service';
+import { isLocalMode, getMockData, Scenario } from "shared";
+
+@Component({
+	selector: 'multi-static-binary',
+	template: `<div #chartRef style="width: 100%; height: 100%;"></div>`,
+})
+export class MultiStaticBinary implements OnDestroy {
+    @ViewChild('chartRef', { static: false }) chartRef!: ElementRef<HTMLDivElement>;
+    @Input({ required: true }) theme!: keyof typeof Themes; 
+    @Input({ required: true }) activeScenario!: Scenario;
+    private destroyLC?: () => void;
+    
+    constructor(lcContextService: LcContextService) {
+    	afterNextRender(() => {
+    		const lc = lcContextService.getLightningChartContext();
+    		const container = this.chartRef.nativeElement;
+    		const chart = lc.ChartXY({ 
+    			defaultAxisX: { type: 'linear-highPrecision', },
+    			container, 
+    			theme: Themes[this.theme], 
+    		})			
+    			.setTitle('Comparative Thermal Analysis of Production Units');
+    		chart.getDefaultAxisX().setTickStrategy(AxisTickStrategies.DateTime).setTitle('Time');
+    		const axisY = chart.getDefaultAxisY().setTitle('Temperature (°C)');
+    		const allSeries: PointLineAreaSeries[] = [];
+    		for (let i = 0; i < 3; i++) {
+    			const series = chart.addLineSeries({ 
+    				axisY, 
+    				schema: {
+    					x: { storage: Float64Array, pattern: 'progressive' },
+    					y: { storage: Float32Array }
+    				} 
+    			})
+    			series.setName(`Machine ${i+1}`);
+    			allSeries.push(series);
+    		};
+
+    		const setupData = async () => {
+    			try {
+    				let arrayBuffer: ArrayBuffer;
+    				let pointsCount: number;
+    				if (isLocalMode()) {
+    					const res = await fetch(`/api/scenarios/${this.activeScenario.fileName}`);
+    					// Parse custom header to get point counts
+    					const pointsCountHeader = res.headers.get('Points-Count');
+    					arrayBuffer = await res.arrayBuffer();
+    					pointsCount = pointsCountHeader ? parseInt(pointsCountHeader, 10) : arrayBuffer.byteLength / 20;
+    				} else {
+    					const data = getMockData(this.activeScenario);
+    					arrayBuffer = data.arrayBuffer;
+    					pointsCount = data.pointsCount;
+    				}
+    				if (chart.isDisposed()) return;
+    				const sharedTimestamps = new Float64Array(arrayBuffer, 0, pointsCount);
+    				const baseTemperatureByteOffset = pointsCount * 8;
+
+    				for (let i = 0; i < 3; i++) {
+    					const machineByteOffset = baseTemperatureByteOffset + (i * pointsCount * 4);
+    					const temperatures = new Float32Array(arrayBuffer, machineByteOffset, pointsCount);
+                
+    					allSeries[i].appendSamples({
+    						x: sharedTimestamps,
+    						y: temperatures,
+    					});
+    				}
+    			} catch (err) {
+    				console.error("Failed to fetch data:", err);
+    				return;
+    			}
+    		};
+    		setupData();
+
+    		this.destroyLC = () => {
+    			chart.dispose();
+    		}
+    	})
+    };
+    
+    ngOnDestroy(): void {
+    	if (this.destroyLC) {
+    		this.destroyLC();
+    	} 
+    };
+}
+```
+
+### File: frameworks\angular\src\scenarios\multi-static.ts
+```ts
+import { afterNextRender, Component, ElementRef, Input, OnDestroy, ViewChild } from '@angular/core';
+import { Themes, PointLineAreaSeries, AxisTickStrategies } from "@lightningchart/lcjs";
+import { LcContextService } from '../lc-context/lc-context.service';
+import { isLocalMode, getMockData, Scenario, SensorData } from "shared";
+
+@Component({
+	selector: 'multi-static',
+	template: `<div #chartRef style="width: 100%; height: 100%;"></div>`,
+})
+export class MultiStatic implements OnDestroy {
+    @ViewChild('chartRef', { static: false }) chartRef!: ElementRef<HTMLDivElement>;
+    @Input({ required: true }) theme!: keyof typeof Themes; 
+    @Input({ required: true }) activeScenario!: Scenario;
+    private destroyLC?: () => void;
+    
+    constructor(lcContextService: LcContextService) {
+    	afterNextRender(() => {
+    		const lc = lcContextService.getLightningChartContext();
+    		const container = this.chartRef.nativeElement;
+    		const chart = lc.ChartXY({ 
+    			defaultAxisX: { type: 'linear-highPrecision', },
+    			container, 
+    			theme: Themes[this.theme], 
+    		})			
+			    .setTitle('Comparative Thermal Analysis of Production Units');
+    		chart.getDefaultAxisX().setTickStrategy(AxisTickStrategies.DateTime).setTitle('Time');
+    		const axisY = chart.getDefaultAxisY().setTitle('Temperature (°C)');
+    		const allSeries: PointLineAreaSeries[] = [];
+    		for (let i = 0; i < 3; i++) {
+    			const series = chart.addLineSeries({ 
+    				axisY, 
+    				schema: {
+    					timestamp: { pattern: 'progressive' },
+    					temperature: { pattern: null },
+    					machineId: { nonNumeric: true }
+    				} 
+    			})
+    			series.setName(`Machine ${i+1}`).setDataMapping({ x: 'timestamp', y: 'temperature' });
+    			allSeries.push(series);
+    		};
+
+    		const setupData = async () => {
+    			try {
+    				let data: SensorData[][] = [];
+    				if (isLocalMode()) {
+    					const res = await fetch(`/api/scenarios/${this.activeScenario.fileName}`);
+    					data = await res.json();
+    				} else {
+    					data = getMockData(this.activeScenario) as SensorData[][];
+    				}
+    				if (chart.isDisposed()) return;
+                    
+    				for (let i = 0; i < allSeries.length; i++) {
+    					allSeries[i].appendJSON(data[i]);
+    				};
+    			} catch (err) {
+    				console.error("Failed to fetch data:", err);
+    				return;
+    			}
+    		};
+    		setupData();
+
+    		this.destroyLC = () => {
+    			chart.dispose();
+    		}
+    	})
+    };
+    
+    ngOnDestroy(): void {
+    	if (this.destroyLC) {
+    		this.destroyLC();
+    	} 
+    };
+}
+```
+
+### File: frameworks\angular\src\scenarios\synced-charts.ts
+```ts
+import { afterNextRender, Component, ElementRef, Input, OnDestroy, signal, ViewChild } from '@angular/core';
+import { Themes, PointLineAreaSeries, AxisTickStrategies, CursorXY, ChartXY, DataSetXY, synchronizeAxisIntervals } from "@lightningchart/lcjs";
+import { LcContextService } from '../lc-context/lc-context.service';
+import { isLocalMode, getMockData, Scenario, SensorData } from "shared";
+
+@Component({
+	selector: 'synced-charts',
+	template: `
+        <div style="width: 100%; height: 100%; display: grid; grid-template-columns: repeat(2, 1fr); grid-template-rows: repeat(2, 1fr);">
+            <div style="padding: 8px;">
+                @if (panelData()) {
+                    <strong>Synchronized Multivariate Production Telemetry</strong><br />
+                    <br />
+                    Production unit: <strong>Machine 1</strong><br />
+                    Average temperature: <strong>{{ panelData()!.temp }}</strong> °C<br>
+                    Average vibration: <strong>{{ panelData()!.vib }}</strong> mm/s<br>
+                    Average throughput: <strong>{{ panelData()!.tp }}</strong> units per second
+                } @else {
+                    Loading data...
+                }
+            </div>
+            <div #chartRef1></div>
+            <div #chartRef2></div>
+            <div #chartRef3></div>
+        </div>
+    `,
+})
+export class SyncedCharts implements OnDestroy {
+    @ViewChild('chartRef1', { static: false }) chartRef1!: ElementRef<HTMLDivElement>;
+    @ViewChild('chartRef2', { static: false }) chartRef2!: ElementRef<HTMLDivElement>;
+    @ViewChild('chartRef3', { static: false }) chartRef3!: ElementRef<HTMLDivElement>;
+    @Input({ required: true }) theme!: keyof typeof Themes; 
+    @Input({ required: true }) activeScenario!: Scenario;
+    private destroyLC?: () => void;
+    private dataSet = new DataSetXY({
+    	schema: {
+    		timestamp: { pattern: 'progressive' },
+    		temperature: { pattern: null },
+    		vibration: { pattern: null },
+    		throughput: { pattern: null }
+    	}
+    });
+    private VALUES: string[] = ['temperature', 'vibration', 'throughput'];
+    private TITLES: string[] = ['Thermal Output Profile (°C)', 'Mechanical Kinematics Profile (mm/s)', 'Production Throughput Efficiency (units/s)'];
+    panelData = signal<{ temp: string; vib: string; tp: string } | null>(null);
+        
+    constructor(lcContextService: LcContextService) {
+    	afterNextRender(() => {
+    		const lc = lcContextService.getLightningChartContext();
+    		const containers = [this.chartRef1, this.chartRef2, this.chartRef3];		
+    		const charts = containers.map((container, i) => {
+    			const chart: ChartXY = lc.ChartXY({
+    				defaultAxisX: { type: 'linear-highPrecision' },
+    				theme: Themes[this.theme], 
+    				container: container.nativeElement,
+    			})
+				    .setTitle(`${this.TITLES[i]}`)
+    				.setCursorMode(undefined);
+    			chart.getDefaultAxisX().setTickStrategy(AxisTickStrategies.DateTime);
+    			const series = chart.addLineSeries().setName(`${this.VALUES[i]}`);
+    			const cursor: CursorXY = chart.addCursor();
+    			cursor.setTickMarkerXVisible(false);
+    			return { chart, cursor, series };
+    		})
+    		synchronizeAxisIntervals(...charts.map((chart) => chart.chart.axisX));
+
+    		const hideCursor = () => {
+    			charts.forEach((chart) => chart.cursor.setVisible(false))
+    		};
+    		const displayCursorAt = (x: number) => {
+    			charts.forEach((chart) => {
+    				const solveResults = chart.chart
+    					.getSeries()
+				        // NOTE: Other series types don't currently have direct API syntax to solve nearest from axis coordinate - for them, you have to first translate axis coordinate to client coordinate and then use solve nearest
+    					.map((series) => series.getCursorEnabled() && series instanceof PointLineAreaSeries && series.solveNearest({ x, y: 0 }))
+    					.filter((solve) => !!solve);
+    				if (solveResults.length > 0) {
+    					chart.cursor
+    						.setVisible(true)
+    						.setPosition(...solveResults.map((solve) => solve.cursorPosition))
+    						.setResultTable((rt) => rt.setContent(chart.chart.getCursorFormatting()(chart.chart, solveResults[0], solveResults)));
+    				} else {
+    					chart.cursor.setVisible(false);
+    				}
+    			});
+    		};
+    		charts.forEach((chart) => {
+    			chart.chart.seriesBackground.addEventListener('pointermove', (event) =>
+    				displayCursorAt(chart.chart.translateCoordinate(event, chart.chart.coordsAxis).x),
+    			);
+    			chart.chart.getSeries().forEach((series) => series.addEventListener('pointermove', (_event, info) => displayCursorAt(info.x)));
+    			chart.chart.seriesBackground.addEventListener('pointerleave', () => hideCursor());
+    		});
+    		const setupData = async () => {
+    			if (!charts || !this.activeScenario) return;
+    			try {
+    				let data: SensorData[][] = [];
+    				if (isLocalMode()) {
+    					const res = await fetch(`/api/scenarios/${this.activeScenario.fileName}`);
+    					data = await res.json();
+    				} else {
+    					data = getMockData(this.activeScenario) as SensorData[][];
+    				}
+    				this.dataSet.clear();
+    				this.dataSet.appendJSON(data, { whitelist: ['timestamp', this.VALUES[0], this.VALUES[1], this.VALUES[2]] });
+    				for (let i = 0; i < charts.length; i++) {
+    					charts[i].series.setDataSet(this.dataSet, { x: 'timestamp', y: this.VALUES[i] });
+    				};
+    				const countAverage = (property: string) => {
+    					const array = this.dataSet.readBack().data[property]
+    					let total = 0
+    					for (let i = 0; i < array.length; i++) {
+    						total += array[i];
+    					}
+    					return total / array.length;
+    				}
+    				this.panelData.set({
+    					temp: countAverage(this.VALUES[0]).toFixed(2),
+    					vib: countAverage(this.VALUES[1]).toFixed(2),
+    					tp: (countAverage(this.VALUES[2]) * 100).toFixed(0)
+    				});
+    			} catch (err) {
+    				console.error("Failed to fetch data:", err);
+    				return;
+    			}
+    		};
+    		setupData();
+
+    		this.destroyLC = () => {
+    			charts.forEach(chart => chart.chart.dispose());
+    		}    
+    	})
+    };
+
+    ngOnDestroy(): void {
+    	if (this.destroyLC) {
+    		this.destroyLC();
+    	} 
+    };
+}
+```
+
+### File: frameworks\angular\src\vite-env.d.ts
+```ts
+/// <reference types="vite/client" />
+
+interface ImportMetaEnv {
+  readonly VITE_LCJS_LICENSE: string;
+}
+
+interface ImportMeta {
+  readonly env: ImportMetaEnv;
+}
+```
+
+### File: frameworks\svelte\src\app.d.ts
+```ts
+/// <reference types="vite/client" />
+
+interface ImportMetaEnv {
+  readonly VITE_LCJS_LICENSE: string;
+}
+
+interface ImportMeta {
+  readonly env: ImportMetaEnv;
+}
+```
+
+### File: frameworks\svelte\src\svelte-wrapper.ts
+```ts
+import { mount, unmount } from "svelte";
+import { SCENARIOS } from "shared";
+
+const scenarioModules = import.meta.glob('./scenarios/*.svelte', { eager: true });
+
+class SvelteScenarioElement extends HTMLElement {
+	private app: Record<string, unknown> | null = null;
+
+	constructor() {
+		super();
+	}
+
+	connectedCallback() {
+		// Read the tags from HTML element's attributes (created in the shell app)
+		const theme = this.getAttribute("theme") ?? "darkGold";
+		const scenarioId = this.getAttribute("scenario-id");
+		const scenario = SCENARIOS.find(s => s.id === scenarioId);
+		let Component = null;
+		if (scenario) {
+			const path = `./scenarios/${scenario.fileName}.svelte`;
+			// Get the right module from Vite's Library
+			const module = scenarioModules[path] as Record<string, unknown>;
+			if (module) {
+				// Exported component from the scenario file
+				Component = module.default || Object.values(module)[0];
+			}
+		}
+		const shadow = this.attachShadow({ mode: "open" });
+		const container = document.createElement("div");
+		container.style.width = "100%";
+		container.style.height = "100%";
+		shadow.appendChild(container);
+		if (Component && scenario) {
+			// Attach the component to target element
+			this.app = mount(Component, {
+				target: container,
+				props: { 
+					activeScenario: scenario, 
+					theme: theme 
+				}
+			});
+		} else {
+			container.innerHTML = `<div>Failed loading scenario: ${scenarioId}</div>`;
+			console.error(`Svelte scenario not found: ${scenarioId}`);
+		}
+	}
+	disconnectedCallback() {
+		if (this.app) {
+			unmount(this.app);
+			this.app = null;
+		}
+	}
+}
+if (!customElements.get("svelte-scenario")) {
+	customElements.define("svelte-scenario", SvelteScenarioElement);
+}
+```
+
+### File: frameworks\vanillajs\src\scenarios\axis-switching.js
+```js
+import { lightningChart, Themes, AxisTickStrategies, DataSetXY } from "@lightningchart/lcjs";
+import { getMockData, isLocalMode } from 'shared';
+
+export default function axisSwitchingScenario(container, props) {
+	container.innerHTML = `
+    	<div style="width: 100%; height: 100%; display: flex; flex-direction: column;">
+			<div style="width: 100%; display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 16px; padding: 8px 0px;">
+				<span style="margin-left: 8px;">
+				    Kinetic Energy Distribution of Machine Vibration (v<sup>2</sup>) Over a 5-Second Interval
+				</span>
+				<span>Toggle axis type:</span>
+				<button id="toggleButton" style="margin-right: 8px;">Linear</button>
+			</div>
+			<div id="${props.activeScenario.id}" style="width: 100%; flex-grow: 1; min-height: 0;"></div>
+		</div>
+    `;    
+	const chartArea = container.querySelector(`#${props.activeScenario.id}`);
+	const toggleButton = container.querySelector("#toggleButton");
+	const lc = lightningChart({ license: import.meta.env.VITE_LCJS_LICENSE, });
+	const dataSet = new DataSetXY({
+		schema: {
+			relativeTime: { pattern: 'progressive' },
+			stress: { pattern: null },
+		}
+	});
+	const chart = lc.ChartXY({
+		legend: { visible: false },
+		container: chartArea,
+		theme: Themes[props.theme],
+	})
+		.setTitle('');
+	const xAxis = chart.getDefaultAxisX().setTitle('Time').setTickStrategy(AxisTickStrategies.Time);
+	const linAxis = chart.getDefaultAxisY().setTitle('Kinetic Energy (lin)');
+	const logAxis = chart.addAxisY({ type: 'logarithmic', base: 10 }).setTitle('Kinetic Energy (log10)');
+	const linSeries = chart.addLineSeries({ axisX: xAxis, axisY: linAxis, automaticColorIndex: 0 }).setName(`Linear Series`);
+	const logSeries = chart.addLineSeries({ axisX: xAxis, axisY: logAxis, automaticColorIndex: 0 }).setName(`Logarithmic Series`);
+	logSeries.setVisible(false);
+	logAxis.setVisible(false);
+	let isDisposed = false; 
+	let isLog = false;
+
+	const setupData = async () => {
+		try {
+			let data;
+			if (isLocalMode()) {
+				const res = await fetch(`/api/scenarios/${props.activeScenario.fileName}`);
+				data = await res.json();
+			} else {
+				data = getMockData(props.activeScenario);
+			}
+			if (isDisposed) return;
+            
+			dataSet.clear();
+			dataSet.appendJSON(data, { whitelist: ['relativeTime', 'stress'] });
+			linSeries.setDataSet(dataSet, { x: 'relativeTime', y: 'stress' });
+			logSeries.setDataSet(dataSet, { x: 'relativeTime', y: 'stress' });			
+		} catch (error) {
+			if (!isDisposed) {
+				console.error("Data fetch failed:", error);
+			}
+		}
+	};
+	setupData();
+
+	toggleButton.addEventListener("click", () => {
+		isLog = !isLog  
+		if (isLog) {
+			linSeries.setVisible(false);
+			linAxis.setVisible(false);
+			logSeries.setVisible(true);
+			logAxis.setVisible(true);
+			logAxis.fit();
+			xAxis.fit();
+			toggleButton.innerHTML = 'Logarithmic';
+		} else {
+			linSeries.setVisible(true);
+			linAxis.setVisible(true);
+			logSeries.setVisible(false);
+			logAxis.setVisible(false);
+			linAxis.fit();
+			xAxis.fit();
+			toggleButton.innerHTML = 'Linear';
+		}
+	})
+
+	return function cleanup() {
+		isDisposed = true;
+		chart.dispose();
+		lc.dispose();
+		container.innerHTML = '';
+	};
+}
+```
+
+### File: frameworks\vanillajs\src\scenarios\basic-chart-component.js
+```js
+import { lightningChart, Themes } from "@lightningchart/lcjs";
+
+export default function basicChartScenario(container, props) {
+	container.innerHTML = `
+        <div id="${props.activeScenario.id}" style="width: 100%; height: 100%;"></div>
+    `;
+	const chartArea = container.querySelector(`#${props.activeScenario.id}`);
+	const lc = lightningChart({ license: import.meta.env.VITE_LCJS_LICENSE });
+	const chart = lc.ChartXY({
+		container: chartArea,
+		theme: Themes[props.theme],
+	})
+		.setTitle(`Vanilla JS: ${props.activeScenario.label}`);
+	const points= [];
+	for (let i = 0; i < 20; i++) {
+		points.push({
+			x: i,
+			y: i
+		})
+	}
+	chart.addPointSeries({
+		schema: {
+			x: { pattern: 'progressive' },
+			y: { pattern: 'progressive' }
+		}
+	})
+		.appendJSON(points);
+
+	return function cleanup() {
+		chart.dispose();
+		lc.dispose();
+		container.innerHTML = '';
+	};
+}
+```
+
+### File: frameworks\vanillajs\src\scenarios\bubble-static.js
+```js
+import { lightningChart, Themes, isHitSampleXY } from "@lightningchart/lcjs";
+import { isLocalMode, getMockData } from "shared";
+
+export default function bubbleStaticScenario(container, props) {
+	container.innerHTML = `
+        <div id="${props.activeScenario.id}" style="width: 100%; height: 100%;"></div>
+    `;
+	const chartArea = container.querySelector(`#${props.activeScenario.id}`);
+	const lc = lightningChart({ license: import.meta.env.VITE_LCJS_LICENSE });
+	const chart = lc.ChartXY({
+		container: chartArea,
+		theme: Themes[props.theme],
+	})
+		.setTitle('Temperature and Vibration by Throughput')
+		.setCursorMode('show-nearest');
+	chart.axisX.setTitle('Temperature (°C)');
+	chart.axisY.setTitle('Vibration (mm/s)');
+	chart.setCursorFormatting((_, hit) => {
+		if (!isHitSampleXY(hit)) return undefined
+		return [
+			[{ text: 'Temperature (°C)', font: { weight: 'bold' } }, '', hit.x.toFixed(2)],
+			[{ text: 'Vibration (mm/s)', font: { weight: 'bold' } }, '', hit.y.toFixed(2)],
+			[{ text: 'Throughput', font: { weight: 'bold' } }, '', hit.size?.toFixed(0)]
+		]
+	});
+	for (let i = 0; i < 4; i += 1) {
+		chart.addPointSeries({
+			schema: {
+				temperature: { pattern: null },
+				vibration: { pattern: null },
+				throughput: { pattern: null },
+				machineId: { nonNumeric: true }
+			}
+		})
+			.setName(`Machine ${i + 1}`)
+			.setDataMapping({ x: 'temperature', y: 'vibration', size: 'throughput' });
+	}
+	let isDisposed = false;
+
+	const setupData = async () => {
+		try {
+			const allSeries = chart.getSeries();
+			let data;
+
+			if (isLocalMode()) {
+				const res = await fetch(`/api/scenarios/${props.activeScenario.fileName}`);
+				data = await res.json();
+			} else {
+				data = getMockData(props.activeScenario);
+			}
+			if (isDisposed) return;
+			for (let i = 0; i < allSeries.length; i += 1) {
+				if (data[i]) {
+					allSeries[i].appendJSON(data[i], { 
+						whitelist: ['machineId', 'temperature', 'vibration', 'throughput'] 
+					});
+				}
+			}
+		} catch (error) {
+			if (!isDisposed) {
+				console.error("Datan lataus epäonnistui:", error);
+			}
+		}
+	};
+	setupData();
+
+	return function cleanup() {
+		isDisposed = true;
+		chart.dispose();
+		lc.dispose();
+		container.innerHTML = '';
+	};
+}
+```
+
+### File: frameworks\vanillajs\src\scenarios\multi-realtime-binary.js
+```js
+import { lightningChart, Themes, AxisTickStrategies, AxisScrollStrategies, PalettedFill, LUT, ColorRGBA, SolidLine } from "@lightningchart/lcjs";
+import { isLocalMode, getMockData } from "shared";
+
+export default function multiRealtimeBinaryScenario(container, props) {
+	container.innerHTML = `
+        <div id="${props.activeScenario.id}" style="width: 100%; height: 100%;"></div>
+    `;
+	const chartArea = container.querySelector(`#${props.activeScenario.id}`);
+	const lc = lightningChart({ license: import.meta.env.VITE_LCJS_LICENSE });
+	const chart = lc.ChartXY({
+		defaultAxisX: { type: 'linear-highPrecision' },
+		legend: { visible: false },
+		container: chartArea,
+		theme: Themes[props.theme],
+	})
+		.setTitle('Real-Time Vibration Profile (M1-M3)');
+	chart.getDefaultAxisX()
+		.setTitle("Time")
+		.setTickStrategy(AxisTickStrategies.DateTime)
+		.setScrollStrategy(AxisScrollStrategies.scrolling)
+		.setDefaultInterval((state) => ({ end: state.dataMax, start: (state.dataMax ?? 0) - 10 * 1000, stopAxisAfter: false }));
+	chart.getDefaultAxisY().dispose();
+
+	const palette = new PalettedFill({
+		lookUpProperty: 'y',
+		lut: new LUT({
+			interpolate: false,
+			steps: [
+				{ value: 0, color: ColorRGBA( 255, 0, 0 ) },
+				{ value: 0.2, color: ColorRGBA( 0, 255, 0 ) },
+				{ value: 4.2, color: ColorRGBA( 255, 0, 0 ) }
+			],
+		})
+	});
+    
+	const allSeries = [];
+	for (let i = 0; i < 3; i++) {
+		const axisY = chart
+			.addAxisY({ iStack: -i })
+			.setTitleRotation(0)
+			.setMargins(i === 1 ? 15 : 0, i === 1 ? 15 : 0);
+		if (i === 1) axisY.setTitle('Vibration (mm/s)').setTitleRotation(270);
+		const series = chart.addLineSeries({ 
+			axisY, 
+			schema: {
+				timestamps: { storage: Float64Array, pattern: 'progressive' },
+				vibrations: { storage: Float32Array },
+			} 
+		})
+			.setName(`Machine ${i+1}`)
+		    // Data cleaning: set the maximum number of samples that are retained
+			.setMaxSampleCount(50_000)
+			.setDataMapping({ x: 'timestamps', y: 'vibrations' })
+			.setStrokeStyle(new SolidLine({ fillStyle: palette}));
+		allSeries.push(series);
+	}
+	let ws = null;
+	let interval = null;
+
+	if (isLocalMode()) {
+		ws = new WebSocket(`ws://localhost:3000/api/scenarios/${props.activeScenario.fileName}`);
+		ws.binaryType = "arraybuffer";
+		ws.onmessage = (e) => {
+			try {
+				const buffer = e.data;
+				const view = new DataView(buffer);
+				const machineIndex = view.getUint8(0);
+				const pointCount = (buffer.byteLength - 8) / 12;
+				const timestamps = new Float64Array(buffer, 8, pointCount);
+				const vibrations = new Float32Array(buffer, 8 + pointCount * 8, pointCount);
+				allSeries[machineIndex].appendSamples({ 
+					timestamps: timestamps, 
+					vibrations: vibrations 
+				});
+			} catch (e) { 
+				console.error(e); 
+			}
+		};
+	} else {
+		const data = getMockData(props.activeScenario);
+		let currentIndex = 0;
+		const tempTimestamps = new Float64Array(1);
+		const tempVibrations = new Float32Array(1);
+
+		interval = setInterval(() => {
+			if (currentIndex >= data[0].timestamps.length) {
+				if (interval) clearInterval(interval);
+				return;
+			}
+			for (let i = 0; i < allSeries.length; i++) {
+				const machineData = data[i];
+				tempTimestamps[0] = machineData.timestamps[currentIndex];
+				tempVibrations[0] = machineData.vibrations[currentIndex];
+				allSeries[i].appendSamples({
+					timestamps: tempTimestamps,
+					vibrations: tempVibrations
+				});
+			}
+			currentIndex++;
+		}, 20);
+	}
+
+	return function cleanup() {
+		if (ws) ws.close();
+		if (interval) clearInterval(interval);
+		chart.dispose();
+		lc.dispose();
+		container.innerHTML = '';
+	};
+}
+```
+
+### File: frameworks\vanillajs\src\scenarios\multi-realtime.js
+```js
+import { lightningChart, Themes, AxisTickStrategies, AxisScrollStrategies, PalettedFill, LUT, ColorRGBA, SolidLine } from "@lightningchart/lcjs";
+import { isLocalMode, getMockData } from "shared";
+
+export default function multiRealtimeScenario(container, props) {
+	container.innerHTML = `
+        <div id="${props.activeScenario.id}" style="width: 100%; height: 100%;"></div>
+    `;
+	const chartArea = container.querySelector(`#${props.activeScenario.id}`);
+	const lc = lightningChart({ license: import.meta.env.VITE_LCJS_LICENSE });
+	const chart = lc.ChartXY({
+		defaultAxisX: { type: 'linear-highPrecision' },
+		legend: { visible: false },
+		container: chartArea,
+		theme: Themes[props.theme],
+	})
+		.setTitle('Real-Time Vibration Profile (M1-M3)');
+	chart.getDefaultAxisX()
+		.setTitle("Time")
+		.setTickStrategy(AxisTickStrategies.DateTime)
+		.setScrollStrategy(AxisScrollStrategies.scrolling)
+		.setDefaultInterval((state) => ({ end: state.dataMax, start: (state.dataMax ?? 0) - 10 * 1000, stopAxisAfter: false }));
+	chart.getDefaultAxisY().dispose();
+
+	const palette = new PalettedFill({
+		lookUpProperty: 'y',
+		lut: new LUT({
+			interpolate: false,
+			steps: [
+				{ value: 0, color: ColorRGBA( 255, 0, 0 ) },
+				{ value: 0.2, color: ColorRGBA( 0, 255, 0 ) },
+				{ value: 4.2, color: ColorRGBA( 255, 0, 0 ) }
+			],
+		})
+	});
+    
+	const allSeries = [];
+	for (let i = 0; i < 3; i++) {
+		const axisY = chart
+			.addAxisY({ iStack: -i })
+			.setTitleRotation(0)
+			.setMargins(i === 1 ? 15 : 0, i === 1 ? 15 : 0);
+		if (i === 1) axisY.setTitle('Vibration (mm/s)').setTitleRotation(270);
+		const series = chart.addLineSeries({ 
+			axisY, 
+			schema: {
+				timestamp: { pattern: 'progressive' },
+				vibration: { pattern: null },
+				machineId: { nonNumeric: true }
+			} 
+		})
+			.setName(`Machine ${i+1}`)
+		    // Data cleaning: set the maximum number of samples that are retained
+			.setMaxSampleCount(50_000)
+			.setDataMapping({ x: 'timestamp', y: 'vibration' })
+			.setStrokeStyle(new SolidLine({ fillStyle: palette}));
+		allSeries.push(series);
+	} 
+	let ws = null;
+	let interval = null;
+
+	if (isLocalMode()) {
+		ws = new WebSocket(`ws://localhost:3000/api/scenarios/${props.activeScenario.fileName}`);
+		ws.onmessage = (e) => {
+			try {
+				const msg = JSON.parse(e.data);
+				for (let i = 0; i < allSeries.length; i++) {
+					allSeries[i].appendJSON(msg[i]);
+				};
+			} catch (e) { 
+				console.error(e); 
+			}
+		};
+	} else {
+		const data = getMockData(props.activeScenario);
+		let dataAmount = 0;
+		interval = setInterval(() => {
+			if (dataAmount >= data[0].length) {
+				if (interval) clearInterval(interval);
+				return;
+			}
+			for (let i = 0; i < allSeries.length; i++) {
+				allSeries[i].appendJSON([{
+					timestamp: data[i][dataAmount].timestamp,
+					vibration: data[i][dataAmount].vibration,
+					machineId: data[i][dataAmount].machineId
+				}]);
+			}
+			dataAmount++;
+		}, 20);
+	}
+
+	return function cleanup() {
+		if (ws) ws.close();
+		if (interval) clearInterval(interval);
+		chart.dispose();
+		lc.dispose();
+		container.innerHTML = '';
+	};
+}
+```
+
+### File: frameworks\vanillajs\src\scenarios\multi-static-binary.js
+```js
+import { lightningChart, Themes, AxisTickStrategies } from "@lightningchart/lcjs";
+import { isLocalMode, getMockData } from "shared";
+
+export default function multiStaticBinaryScenario(container, props) {
+	container.innerHTML = `
+        <div id="${props.activeScenario.id}" style="width: 100%; height: 100%;"></div>
+    `;
+	const chartArea = container.querySelector(`#${props.activeScenario.id}`);
+	const lc = lightningChart({ license: import.meta.env.VITE_LCJS_LICENSE });
+	const chart = lc.ChartXY({
+		defaultAxisX: { type: 'linear-highPrecision' },
+		container: chartArea,
+		theme: Themes[props.theme],
+	})
+		.setTitle('Comparative Thermal Analysis of Production Units');
+	chart.getDefaultAxisX().setTickStrategy(AxisTickStrategies.DateTime).setTitle('Time');
+	const axisY = chart.getDefaultAxisY().setTitle('Temperature (°C)');
+	const allSeries = [];
+	for (let i = 0; i < 3; i++) {
+		const series = chart.addLineSeries({ 
+			axisY, 
+			schema: {
+				x: { storage: Float64Array, pattern: 'progressive' },
+				y: { storage: Float32Array }
+			}
+		});
+		series.setName(`Machine ${i+1}`);
+		allSeries.push(series);
+	};
+	let isDisposed = false; 
+
+	const setupData = async () => {
+		try {
+			let arrayBuffer;
+			let pointsCount;
+			if (isLocalMode()) {
+				const res = await fetch(`/api/scenarios/${props.activeScenario.fileName}`);
+				// Parse custom header to get point counts
+				const pointsCountHeader = res.headers.get('Points-Count');
+				arrayBuffer = await res.arrayBuffer();
+				pointsCount = pointsCountHeader ? parseInt(pointsCountHeader, 10) : arrayBuffer.byteLength / 20;
+			} else {
+				const data = getMockData(props.activeScenario);
+				arrayBuffer = data.arrayBuffer;
+				pointsCount = data.pointsCount;
+			}
+			if (isDisposed || chart.isDisposed()) return;
+			const sharedTimestamps = new Float64Array(arrayBuffer, 0, pointsCount);
+			const baseTemperatureByteOffset = pointsCount * 8;
+
+			for (let i = 0; i < 3; i++) {
+				const machineByteOffset = baseTemperatureByteOffset + (i * pointsCount * 4);
+				const temperatures = new Float32Array(arrayBuffer, machineByteOffset, pointsCount);
+            
+				allSeries[i].appendSamples({
+					x: sharedTimestamps,
+					y: temperatures,
+				});
+			}
+		} catch (error) {
+			if (!isDisposed) {
+				console.error("Data fetch failed:", error);
+			}
+		}
+	};
+	setupData();
+
+	return function cleanup() {
+		isDisposed = true;
+		chart.dispose();
+		lc.dispose();
+		container.innerHTML = '';
+	};
+}
+```
+
+### File: frameworks\vanillajs\src\scenarios\multi-static.js
+```js
+import { lightningChart, Themes, AxisTickStrategies } from "@lightningchart/lcjs";
+import { isLocalMode, getMockData } from "shared";
+
+export default function multiStaticScenario(container, props) {
+	container.innerHTML = `
+        <div id="${props.activeScenario.id}" style="width: 100%; height: 100%;"></div>
+    `;
+	const chartArea = container.querySelector(`#${props.activeScenario.id}`);
+	const lc = lightningChart({ license: import.meta.env.VITE_LCJS_LICENSE });
+	const chart = lc.ChartXY({
+		defaultAxisX: { type: 'linear-highPrecision' },
+		container: chartArea,
+		theme: Themes[props.theme],
+	})
+		.setTitle('Comparative Thermal Analysis of Production Units');
+	chart.getDefaultAxisX().setTickStrategy(AxisTickStrategies.DateTime).setTitle('Time');
+	const axisY = chart.getDefaultAxisY().setTitle('Temperature (°C)');
+	const allSeries = [];
+	for (let i = 0; i < 3; i++) {
+		const series = chart.addLineSeries({ 
+			axisY, 
+			schema: {
+				timestamp: { pattern: 'progressive' },
+				temperature: { pattern: null },
+				machineId: { nonNumeric: true }
+			} 
+		})
+		series.setName(`Machine ${i+1}`).setDataMapping({ x: 'timestamp', y: 'temperature' });
+		allSeries.push(series);
+	};
+	let isDisposed = false; 
+
+	const setupData = async () => {
+		try {
+			const allSeries = chart.getSeries();
+			let data;
+			if (isLocalMode()) {
+				const res = await fetch(`/api/scenarios/${props.activeScenario.fileName}`);
+				data = await res.json();
+			} else {
+				data = getMockData(props.activeScenario);
+			}
+			if (isDisposed) return;
+            
+			for (let i = 0; i < allSeries.length; i++) {
+				allSeries[i].appendJSON(data[i]);
+			};
+		} catch (error) {
+			if (!isDisposed) {
+				console.error("Data fetch failed:", error);
+			}
+		}
+	};
+	setupData();
+
+	return function cleanup() {
+		isDisposed = true;
+		chart.dispose();
+		lc.dispose();
+		container.innerHTML = '';
+	};
+}
+```
+
+### File: frameworks\vanillajs\src\scenarios\synced-charts.js
+```js
+import { lightningChart, Themes, AxisTickStrategies, DataSetXY, synchronizeAxisIntervals } from "@lightningchart/lcjs";
+import { getMockData, isLocalMode } from 'shared';
+
+const VALUES = ['temperature', 'vibration', 'throughput'];
+const TITLES = ['Thermal Output Profile (°C)', 'Mechanical Kinematics Profile (mm/s)', 'Production Throughput Efficiency (units/s)'];
+
+export default function syncedChartsScenario(container, props) {
+	container.innerHTML = `
+        <div style="width: 100%; height: 100%; display: grid; grid-template-columns: repeat(2, 1fr); grid-template-rows: repeat(2, 1fr);">
+            <div id="dataPanel" style="padding: 8px;">Loading data...</div>
+            <div id="${props.activeScenario.id}1" style="width: 100%; height: 100%;"></div>
+            <div id="${props.activeScenario.id}2" style="width: 100%; height: 100%;"></div>
+            <div id="${props.activeScenario.id}3" style="width: 100%; height: 100%;"></div>
+        </div>
+    `;    
+	const chartArea1 = container.querySelector(`#${props.activeScenario.id}1`);
+	const chartArea2 = container.querySelector(`#${props.activeScenario.id}2`);
+	const chartArea3 = container.querySelector(`#${props.activeScenario.id}3`);
+	const dataPanel = container.querySelector(`#dataPanel`);
+	const lc = lightningChart({ license: import.meta.env.VITE_LCJS_LICENSE, });
+	const dataSet = new DataSetXY({
+		schema: {
+			timestamp: { pattern: 'progressive' },
+			temperature: { pattern: null },
+			vibration: { pattern: null },
+			throughput: { pattern: null }
+		}
+	});
+	const containers = [chartArea1, chartArea2, chartArea3];
+	const charts = containers.map((container, i) => {
+		const chart = lc.ChartXY({
+			defaultAxisX: { type: 'linear-highPrecision' },
+			theme: Themes[props.theme],
+			container: container,
+		})
+			.setTitle(`${TITLES[i]}`)
+			.setCursorMode(undefined);
+		chart.getDefaultAxisX().setTickStrategy(AxisTickStrategies.DateTime);
+		const series = chart.addLineSeries().setName(`${VALUES[i]}`);
+		const cursor = chart.addCursor();
+		cursor.setTickMarkerXVisible(false);
+		return { chart, cursor, series };
+	})
+	synchronizeAxisIntervals(...charts.map((chart) => chart.chart.axisX));
+
+	const hideCursor = () => {
+		charts.forEach((chart) => chart.cursor.setVisible(false))
+	};
+	const displayCursorAt = (x) => {
+		charts.forEach((chart) => {
+			const solveResults = chart.chart
+				.getSeries()
+			    // NOTE: Other series types don't currently have direct API syntax to solve nearest from axis coordinate - for them, you have to first translate axis coordinate to client coordinate and then use solve nearest
+				.map((series) => series.getCursorEnabled() && series.solveNearest({ x, y: 0 }))
+				.filter((solve) => !!solve);
+			if (solveResults.length > 0) {
+				chart.cursor
+					.setVisible(true)
+					.setPosition(...solveResults.map((solve) => solve.cursorPosition))
+					.setResultTable((rt) => rt.setContent(chart.chart.getCursorFormatting()(chart.chart, solveResults[0], solveResults)));
+			} else {
+				chart.cursor.setVisible(false);
+			}
+		});
+	};
+	charts.forEach((chart) => {
+		chart.chart.seriesBackground.addEventListener('pointermove', (event) =>
+			displayCursorAt(chart.chart.translateCoordinate(event, chart.chart.coordsAxis).x),
+		);
+		chart.chart.getSeries().forEach((series) => series.addEventListener('pointermove', (event, info) => displayCursorAt(info.x)));
+		chart.chart.seriesBackground.addEventListener('pointerleave', () => hideCursor());
+	});
+	let isDisposed = false; 
+    
+	const setPanelData = (data) => {
+		dataPanel.innerHTML = `
+            <strong>Synchronized Multivariate Production Telemetry</strong><br />
+            <br />
+            Production unit: <strong>Machine 1</strong><br />
+            Average temperature: <strong>${data.temp}</strong> °C<br />
+            Average vibration: <strong>${data.vib}</strong> mm/s<br />
+            Average throughput: <strong>${data.tp}</strong> units per second
+        `;
+	};
+
+	const setupData = async () => {
+		try {
+			let data;
+			if (isLocalMode()) {
+				const res = await fetch(`/api/scenarios/${props.activeScenario.fileName}`);
+				data = await res.json();
+			} else {
+				data = getMockData(props.activeScenario);
+			}
+			if (isDisposed) return;
+            
+			dataSet.appendJSON(data, { whitelist: ['timestamp', VALUES[0], VALUES[1], VALUES[2]] });
+			for (let i = 0; i < charts.length; i++) {
+				charts[i].series.setDataSet(dataSet, { x: 'timestamp', y: VALUES[i] });
+			};		
+			const countAverage = (property) => {
+				const array = dataSet.readBack().data[property];
+				let total = 0;
+				for (let i = 0; i < array.length; i++) {
+					total += array[i];
+				}
+				return total / array.length;
+			}
+			setPanelData({
+				temp: countAverage(VALUES[0]).toFixed(2),
+				vib: countAverage(VALUES[1]).toFixed(2),
+				tp: (countAverage(VALUES[2]) * 100).toFixed(0)
+			});
+		} catch (err) {
+			console.error("Failed to fetch data:", err);
+			return;
+		}
+	};
+	setupData();
+
+	return function cleanup() {
+		isDisposed = true;
+		charts.forEach(chart => chart.chart.dispose());
+		lc.dispose();
+		container.innerHTML = '';
+	};
+}
+```
+
+### File: frameworks\vanillajs\src\vanillajs-wrapper.js
+```js
+import { SCENARIOS } from "shared";
+const scenarioModules = import.meta.glob('./scenarios/*.js', { eager: true });
+
+class VanillajsScenarioElement extends HTMLElement {
+	static get observedAttributes() { return ['scenario-id', 'theme']; }
+
+	constructor() {
+		super();
+		this.cleanup = null;
+		this.shadow = this.attachShadow({ mode: "open" });
+		this.container = document.createElement("div");
+		this.container.style.width = "100%";
+		this.container.style.height = "100%";
+		this.shadow.appendChild(this.container);
+	}
+
+	connectedCallback() {
+		this.render();
+	}
+
+	attributeChangedCallback(name, oldVal, newVal) {
+		if (oldVal && oldVal !== newVal) this.render();
+	}
+
+	disconnectedCallback() {
+		if (this.cleanup) this.cleanup();
+	}
+
+	render() {
+		if (this.cleanup) this.cleanup();
+		this.container.innerHTML = '';
+		// Read the tags from HTML element's attributes (created in the shell app)
+		const theme = this.getAttribute("theme") ?? "darkGold";
+		const scenarioId = this.getAttribute("scenario-id");
+		const scenario = SCENARIOS.find(s => s.id === scenarioId);
+
+		if (scenario) {
+			// Get the right module from Vite's Library
+			const module = scenarioModules[`./scenarios/${scenario.fileName}.js`];
+			if (module) {
+				// Call ScenarioFunction and pass the container and properties
+				// ScenarioFunction returns a cleanup function that is saved to "this.cleanup"
+				const ScenarioFunction = module.default || Object.values(module)[0];
+				this.cleanup = ScenarioFunction(this.container, { activeScenario: scenario, theme });
+				return;
+			}
+		}
+		console.error(`Vanilla JS scenario not found: ${scenarioId}`);
+	}
+}
+if (!customElements.get("vanillajs-scenario")) {
+	customElements.define("vanillajs-scenario", VanillajsScenarioElement);
+}
+```
+
+### File: frameworks\vanillajs\src\vite-env.d.ts
+```ts
+/// <reference types="vite/client" />
+
+interface ImportMetaEnv {
+  readonly VITE_LCJS_LICENSE: string;
+}
+
+interface ImportMeta {
+  readonly env: ImportMetaEnv;
+}
+```
+
+### File: viewer\src\App.d.ts
+```ts
+import '@mantine/core/styles.css';
+import '@mantine/code-highlight/styles.css';
+declare function App(): import("react/jsx-runtime").JSX.Element;
+export default App;
+
+```
+
+### File: viewer\src\App.tsx
+```tsx
+import '@mantine/core/styles.css';
+import '@mantine/code-highlight/styles.css';
+import { MantineProvider, Title, Paper, Box, ScrollArea, NavLink, Group, CopyButton, Tooltip, Button } from '@mantine/core';
+import { CodeHighlightAdapterProvider, createShikiAdapter, CodeHighlight } from '@mantine/code-highlight';
+import { Group as ResizableGroup, Panel, Separator} from 'react-resizable-panels';
+import { Copy, Check } from 'lucide-react';
+import { useEffect, useState, useRef, useMemo } from 'react';
+import ReactMarkdown from 'react-markdown';
+import { SCENARIOS, FRAMEWORKS } from 'shared';
+import logo from '../../shared/assets/logo.svg';
+
+// Parse all code view files in ?raw format at build
+const backendImports = import.meta.glob('../../backend/src/scenarios/*.ts', {
+	query: '?raw',
+	import: 'default',
+});
+const frontendImports = import.meta.glob('../../frameworks/*/src/scenarios/*.{tsx,vue,ts,svelte,js}', {
+	query: '?raw',
+	import: 'default',
+});
+
+
+async function loadShiki() {
+	const { createHighlighter } = await import('shiki');
+	const shiki = await createHighlighter({
+		langs: ['typescript', 'angular-ts', 'javascript', 'vue', 'svelte'],
+		themes: [],
+	});
+	return shiki;
+}
+
+const shikiAdapter = createShikiAdapter(loadShiki);
+
+const ScenarioLoader = ({ frameworkId, scenarioId, theme }: { frameworkId: string, scenarioId: string, theme: string }) => {
+	const containerRef = useRef<HTMLDivElement>(null);
+
+	useEffect(() => {
+		const scenario = SCENARIOS.find(s => s.id === scenarioId);
+		if (!scenario || !containerRef.current) return;
+		const bundleUrl = `/frameworks/${frameworkId}/dist/${frameworkId}-scenarios.js`;
+		const container = containerRef.current;
+
+		const mountComponent = async () => {
+			try {
+				// Load Web Component -bundle
+				// Tell Vite to not package this file during build, because it's being fetched during runtime
+				await import(/* @vite-ignore */ bundleUrl);
+				const element = document.createElement(`${frameworkId}-scenario`);
+				// Set a tag for the framework wrapper to read
+				element.setAttribute("theme", theme);
+				element.setAttribute("scenario-id", scenarioId);
+				element.style.width = '100%';
+				element.style.height = '100%';
+				if (container) {
+					container.innerHTML = '';
+					container.appendChild(element);
+				}
+			} catch (e) {
+				console.error("Failed loading Web Component", e);
+			}
+		};
+		mountComponent();
+		return () => { 
+			if (container) container.innerHTML = ''; 
+		};
+	}, [frameworkId, scenarioId, theme]);
+
+	return <Box ref={containerRef} h="100%" w="100%" />;
+};
+
+const CodeView = ({ title, code, language }: { title: string; code: string; language?: string }) => {
+	return (
+		<Paper h="100%" withBorder radius={0} style={{ display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+			<Group justify="space-between" p="xs" bg="var(--mantine-color-dark-7)" style={{ borderBottom: '1px solid var(--mantine-color-dark-4)' }}>
+				<Title order={6} size="xs" c="gray.3" fw={600}>{title}</Title>
+				<CopyButton value={code} timeout={2000}>
+					{({ copied, copy }) => (
+						<Tooltip label={copied ? 'Copied!' : 'Copy code'} withArrow position="left">
+							<Button color={copied ? 'teal' : 'gray'} variant="subtle" onClick={copy} size="xs" px={5} miw={40}>
+								{copied ? <Check size={16} /> : <Copy size={16} />}
+							</Button>
+						</Tooltip>
+					)}
+				</CopyButton>
+			</Group>
+			<ScrollArea style={{ flex: 1 }} bg="var(--mantine-color-dark-9)">
+				<CodeHighlight 
+					code={code} 
+					language={language} 
+					withCopyButton={false}
+					styles={{
+						code: { backgroundColor: 'transparent' },
+						pre: { backgroundColor: 'transparent', padding: '0rem' }
+					}}
+				/>
+			</ScrollArea>
+		</Paper>
+	);
+};
+
+function App() {
+	const [theme, setTheme] = useState("darkGold");
+	const [isIntroVisible, setIsIntroVisible] = useState(false);
+	const [scenarioId, setScenarioId] = useState(SCENARIOS[0].id);
+	const [frameworkId, setFrameworkId] = useState(FRAMEWORKS[0].id);
+	const [backendCode, setBackendCode] = useState<string>("Loading backend code...");
+	const [frontendCode, setFrontendCode] = useState<string>("Loading frontend code...");
+	const [language, setLanguage] = useState('typescript');
+
+	const activeScenario = useMemo(() => 
+		SCENARIOS.find(s => s.id === scenarioId) || SCENARIOS[0], 
+	[scenarioId]);
+
+	const activeFramework = useMemo(() => 
+		FRAMEWORKS.find(f => f.id === frameworkId) || FRAMEWORKS[0], 
+	[frameworkId]);
+
+	// Fetch code as text when scenario/framework changes
+	useEffect(() => {
+		const fetchCodes = async () => {
+			try {
+				const getBackCode = backendImports[`../../backend/src/scenarios/${activeScenario.fileName}.ts`];
+				const getFrontCode = frontendImports[`../../frameworks/${activeFramework.id}/src/scenarios/${activeScenario.fileName}.${activeFramework.extension}`];
+				if (getBackCode) {
+					const backCode = await getBackCode() as string;
+					setBackendCode(backCode);
+				}
+				if (getFrontCode) {
+					const frontCode = await getFrontCode() as string;
+					setFrontendCode(frontCode);
+				}
+				setLanguage(activeFramework.language);
+			} catch (error) {
+				console.error("Error loading code:", error);
+			}
+		};
+		fetchCodes();
+	}, [activeScenario, activeFramework]);
+
+	useEffect(() => {
+		console.log('Current theme: ', theme);
+	}, [theme]);
+  
+	return (
+		<MantineProvider defaultColorScheme="dark">
+			<CodeHighlightAdapterProvider adapter={shikiAdapter}>
+				<Box h="100vh" w="100vw" style={{ display: 'flex', overflow: 'hidden' }}>
+					{/* Left side: navigation */}      
+					<Box component="nav" className="box-left">
+						<ScrollArea h="100%" p="sm">
+							<img src={logo} alt="Logo" />
+							<NavLink label="Introduction" onClick={() => setIsIntroVisible(true)} fw="700" mt="sm" c="yellow.4">
+							</NavLink>
+							<NavLink href="#required-for-focus" label="Frameworks" fw="700" mt="sm" c="yellow.4" childrenOffset={20} defaultOpened>
+								{FRAMEWORKS.map((f) => (
+									<NavLink
+										key={f.id}
+										label={f.label}
+										active={frameworkId === f.id}
+										onClick={() => {setFrameworkId(f.id); setIsIntroVisible(false)}}
+										variant="light"
+										style={{ color: 'goldenrod', borderRadius: '4px' }}
+									/>
+								))}
+							</NavLink>
+							<NavLink href="#required-for-focus" label="Scenarios" fw="700" mt="sm" c="yellow.4" childrenOffset={20} defaultOpened>
+								{SCENARIOS.map((s) => (
+									<NavLink
+										key={s.id}
+										label={s.label}
+										active={scenarioId === s.id}
+										onClick={() => {setScenarioId(s.id); setIsIntroVisible(false)}}
+										variant="light"
+										style={{ color: 'goldenrod', borderRadius: '4px' }}
+									/>
+								))}
+							</NavLink>
+						</ScrollArea>
+					</Box>
+					{/* Right side */}
+					<Box className="box-right">
+						{isIntroVisible ? 
+							<Box h="100%" bg="#050505"style={{ position: 'relative' }}>
+								ADD INTRO ELEMENT HERE
+							</Box>
+							: 
+							<ResizableGroup orientation="vertical">
+								{/* Info panel */}
+								<Panel defaultSize={10} minSize={10}>
+									<ReactMarkdown>{activeScenario.info}</ReactMarkdown>
+								</Panel>
+								<Separator className="v-resize-handle" />
+								{/* Code views */}
+								<Panel defaultSize={45} minSize={20}>
+									<ResizableGroup orientation="horizontal">
+										<Panel defaultSize={50} minSize={20}>
+											<CodeView title="Backend" code={backendCode} language={'typescript'} />
+										</Panel>
+										<Separator className="h-resize-handle" />
+										<Panel defaultSize={50} minSize={20}>
+											<CodeView title={`Component (${activeFramework.label})`} code={frontendCode} language={language} />
+										</Panel>
+									</ResizableGroup>
+								</Panel>
+								<Separator className="v-resize-handle" />
+								{/* Chart view */}
+								<Panel defaultSize={45} minSize={20}>
+									<Box h="100%" bg="#050505"style={{ position: 'relative' }}>
+										<ScenarioLoader frameworkId={frameworkId} scenarioId={scenarioId} theme={theme} />
+									</Box>
+								</Panel>
+							</ResizableGroup>
+						}
+					</Box>
+				</Box>
+			</CodeHighlightAdapterProvider>
+		</MantineProvider>
+	);
+}
+
+export default App;
+```
+
+### File: viewer\src\main.d.ts
+```ts
+import './index.css';
+
+```
+
+### File: viewer\src\main.tsx
+```tsx
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import './index.css'
+import App from './App.tsx'
+
+window.__IS_LOCAL_MODE__ = import.meta.env.DEV;
+
+document.addEventListener('click', function(event: MouseEvent) {
+	const target = event.target as HTMLElement | null;
+	const link = target?.closest('a');
+    
+	if (link && link.href) {
+		if (link.host !== window.location.host) {
+			link.setAttribute('target', '_blank');
+			link.setAttribute('rel', 'noopener noreferrer');
+		}
+	}
+});
+
+createRoot(document.getElementById('root')!).render(
+	<StrictMode>
+		<App />
+	</StrictMode>,
+)
+
+```
+
+### File: viewer\src\vite-env.d.ts
+```ts
+/// <reference types="vite/client" />
+
+interface ImportMetaEnv {
+  readonly VITE_LCJS_LICENSE: string;
+}
+
+interface ImportMeta {
+  readonly env: ImportMetaEnv;
+}
+```
+

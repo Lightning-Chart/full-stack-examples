@@ -1,0 +1,41 @@
+{
+  "name": "full-stack-examples",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "viewer",
+    "backend",
+    "shared",
+    "frameworks/*"
+  ],
+  "scripts": {
+    "lint": "eslint .",
+    "prepare": "npm run build-dependencies",
+    "build-dependencies": "npm run build -w shared -w frameworks/react -w frameworks/vue -w frameworks/angular -w frameworks/svelte -w frameworks/vanillajs --if-present",
+    "dev-backend": "npm run dev -w backend",
+    "dev-viewer": "npm run dev -w viewer",
+    "dev-frameworks": "npm run watch -w frameworks/react -w frameworks/vue -w frameworks/angular -w frameworks/svelte -w frameworks/vanillajs --if-present",
+    "dev": "npm run generate-llms && concurrently -n \"BACKEND,VIEWER,FRAMEWORKS\" \"npm run dev-backend\" \"npm run dev-viewer\" \"npm run dev-frameworks\"",
+    "build-frameworks": "npm run build -w frameworks/react -w frameworks/vue -w frameworks/angular -w frameworks/svelte -w frameworks/vanillajs --if-present",
+    "build": "npm run generate-llms && npm run build --workspaces --if-present",
+    "postbuild": "node build.js",
+    "serve": "npx live-server ./build",
+    "update-lcjs": "node scripts/update-lcjs.js",
+    "generate-llms": "node scripts/generate-llms.js"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.1",
+    "@types/node": "^22.19.15",
+    "concurrently": "^9.2.1",
+    "eslint": "^9.39.4",
+    "eslint-plugin-angular": "^5.0.0",
+    "eslint-plugin-react": "^7.37.5",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-react-refresh": "^0.5.2",
+    "eslint-plugin-svelte": "^3.17.0",
+    "eslint-plugin-vue": "^10.8.0",
+    "globals": "^17.4.0",
+    "typescript-eslint": "^8.57.1",
+    "vue-eslint-parser": "^10.4.0"
+  }
+}

@@ -1,93 +1,76 @@
-# Full-stack examples
+# LCJS Reference Implementations
+
+This repository provides high-performance LightningChart JS (LCJS) integration examples for modern web frameworks. Created as a Bachelor’s Thesis for Savonia UAS (commissioned by LightningChart Ltd.), the goal is to make LCJS integration simple and fast for developers.
 
 
+## Quick Start
 
-## Getting started
+### 1. Installation
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
-
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-* [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
-
+Clone the repository and install all workspace dependencies **from the root folder**:
 ```
-cd existing_repo
-git remote add origin https://cleo.lightningchart.com/arction/lcjs/full-stack-examples.git
-git branch -M main
-git push -uf origin main
+npm install
 ```
 
-## Integrate with your tools
+### 2. Environment Setup
+A valid [LightningChart JS license key](https://lightningchart.com/js-charts/#license-key) is required for the charts to function.
 
-* [Set up project integrations](https://cleo.lightningchart.com/arction/lcjs/full-stack-examples/-/settings/integrations)
+1. Copy the `.env.example` file to a new file named `.env` in the project root.
 
-## Collaborate with your team
+2. Replace the placeholder with your actual license key:
+    ```
+    VITE_LCJS_LICENSE="license key goes here"
+    ```
 
-* [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+### 3. Usage
 
-## Test and Deploy
+#### Development Mode
 
-Use the built-in continuous integration in GitLab.
+Starts the Node.js backend and the Vite development server for the viewer application.
+```
+npm run dev
+```
+Open the local URL shown in your terminal (usually **localhost:5173**).
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+#### Production Preview
 
-***
+Compiles all assets and serves them via a local production-grade server to simulate a real deployment.
+```
+npm run build
+npm run serve
+```
 
-# Editing this README
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+## Running Modes
+The application environment is configured at launch to operate in one of two modes:
 
-## Suggestions for a good README
+- **Local Mode**: A full-stack environment using the Node.js `/backend` and a SQLite database. This mode supports real-time data streaming via WebSockets and persistent data storage.
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+- **Browser Mode**: A standalone client-side version. It uses internal data generators for interactive previews, requiring no external backend or database.
 
-## Name
-Choose a self-explaining name for your project.
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+## AI-Optimized Documentation
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+This project features a modular documentation suite specifically generated for Large Language Models (LLMs). It provides AI assistants with the necessary context to help you with framework-specific implementations.
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+- **Modular Context:** The system generates targeted documentation files located in the `/backend/llms` directory (e.g., `full.txt` and framework-specific versions).
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+- **Auto-update:** The documentation is automatically updated during `npm run dev` and `npm run build`.
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+- **Manual Update:** You can manually trigger the generation by running `npm run generate-llms` in the root folder.
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+- **Access:** When running in Local Mode, the documentation index is served at `/llms.txt`.
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+## Repository Structure
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+- `/backend`: Node.js server with SQLite for local data storage and real-time streaming.
+- `/docs`: Project documentation.
+- `/frameworks`: Source code for React, Vue, Angular, Svelte, and Vanilla JS.
+- `/shared`: Shared types, reusable logic, and mock data generators.
+- `/viewer`: The main UI app that integrates scenarios and displays source code.
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+## Project Info
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+- Author: [Jenni Mikkonen](https://jenni-mikkonen.netlify.app/)
+- Target completion: August 2026

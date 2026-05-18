@@ -1,0 +1,775 @@
+# Vanilla JS Frontend
+
+### File: frameworks\vanillajs\src\scenarios\axis-switching.js
+```js
+import { lightningChart, Themes, AxisTickStrategies, DataSetXY } from "@lightningchart/lcjs";
+import { getMockData, isLocalMode } from 'shared';
+
+export default function axisSwitchingScenario(container, props) {
+	container.innerHTML = `
+    	<div style="width: 100%; height: 100%; display: flex; flex-direction: column;">
+			<div style="width: 100%; display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 16px; padding: 8px 0px;">
+				<span style="margin-left: 8px;">
+				    Kinetic Energy Distribution of Machine Vibration (v<sup>2</sup>) Over a 5-Second Interval
+				</span>
+				<span>Toggle axis type:</span>
+				<button id="toggleButton" style="margin-right: 8px;">Linear</button>
+			</div>
+			<div id="${props.activeScenario.id}" style="width: 100%; flex-grow: 1; min-height: 0;"></div>
+		</div>
+    `;    
+	const chartArea = container.querySelector(`#${props.activeScenario.id}`);
+	const toggleButton = container.querySelector("#toggleButton");
+	const lc = lightningChart({ license: import.meta.env.VITE_LCJS_LICENSE, });
+	const dataSet = new DataSetXY({
+		schema: {
+			relativeTime: { pattern: 'progressive' },
+			stress: { pattern: null },
+		}
+	});
+	const chart = lc.ChartXY({
+		legend: { visible: false },
+		container: chartArea,
+		theme: Themes[props.theme],
+	})
+		.setTitle('');
+	const xAxis = chart.getDefaultAxisX().setTitle('Time').setTickStrategy(AxisTickStrategies.Time);
+	const linAxis = chart.getDefaultAxisY().setTitle('Kinetic Energy (lin)');
+	const logAxis = chart.addAxisY({ type: 'logarithmic', base: 10 }).setTitle('Kinetic Energy (log10)');
+	const linSeries = chart.addLineSeries({ axisX: xAxis, axisY: linAxis, automaticColorIndex: 0 }).setName(`Linear Series`);
+	const logSeries = chart.addLineSeries({ axisX: xAxis, axisY: logAxis, automaticColorIndex: 0 }).setName(`Logarithmic Series`);
+	logSeries.setVisible(false);
+	logAxis.setVisible(false);
+	let isDisposed = false; 
+	let isLog = false;
+
+	const setupData = async () => {
+		try {
+			let data;
+			if (isLocalMode()) {
+				const res = await fetch(`/api/scenarios/${props.activeScenario.fileName}`);
+				data = await res.json();
+			} else {
+				data = getMockData(props.activeScenario);
+			}
+			if (isDisposed) return;
+            
+			dataSet.clear();
+			dataSet.appendJSON(data, { whitelist: ['relativeTime', 'stress'] });
+			linSeries.setDataSet(dataSet, { x: 'relativeTime', y: 'stress' });
+			logSeries.setDataSet(dataSet, { x: 'relativeTime', y: 'stress' });			
+		} catch (error) {
+			if (!isDisposed) {
+				console.error("Data fetch failed:", error);
+			}
+		}
+	};
+	setupData();
+
+	toggleButton.addEventListener("click", () => {
+		isLog = !isLog  
+		if (isLog) {
+			linSeries.setVisible(false);
+			linAxis.setVisible(false);
+			logSeries.setVisible(true);
+			logAxis.setVisible(true);
+			logAxis.fit();
+			xAxis.fit();
+			toggleButton.innerHTML = 'Logarithmic';
+		} else {
+			linSeries.setVisible(true);
+			linAxis.setVisible(true);
+			logSeries.setVisible(false);
+			logAxis.setVisible(false);
+			linAxis.fit();
+			xAxis.fit();
+			toggleButton.innerHTML = 'Linear';
+		}
+	})
+
+	return function cleanup() {
+		isDisposed = true;
+		chart.dispose();
+		lc.dispose();
+		container.innerHTML = '';
+	};
+}
+```
+
+### File: frameworks\vanillajs\src\scenarios\basic-chart-component.js
+```js
+import { lightningChart, Themes } from "@lightningchart/lcjs";
+
+export default function basicChartScenario(container, props) {
+	container.innerHTML = `
+        <div id="${props.activeScenario.id}" style="width: 100%; height: 100%;"></div>
+    `;
+	const chartArea = container.querySelector(`#${props.activeScenario.id}`);
+	const lc = lightningChart({ license: import.meta.env.VITE_LCJS_LICENSE });
+	const chart = lc.ChartXY({
+		container: chartArea,
+		theme: Themes[props.theme],
+	})
+		.setTitle(`Vanilla JS: ${props.activeScenario.label}`);
+	const points= [];
+	for (let i = 0; i < 20; i++) {
+		points.push({
+			x: i,
+			y: i
+		})
+	}
+	chart.addPointSeries({
+		schema: {
+			x: { pattern: 'progressive' },
+			y: { pattern: 'progressive' }
+		}
+	})
+		.appendJSON(points);
+
+	return function cleanup() {
+		chart.dispose();
+		lc.dispose();
+		container.innerHTML = '';
+	};
+}
+```
+
+### File: frameworks\vanillajs\src\scenarios\bubble-static.js
+```js
+import { lightningChart, Themes, isHitSampleXY } from "@lightningchart/lcjs";
+import { isLocalMode, getMockData } from "shared";
+
+export default function bubbleStaticScenario(container, props) {
+	container.innerHTML = `
+        <div id="${props.activeScenario.id}" style="width: 100%; height: 100%;"></div>
+    `;
+	const chartArea = container.querySelector(`#${props.activeScenario.id}`);
+	const lc = lightningChart({ license: import.meta.env.VITE_LCJS_LICENSE });
+	const chart = lc.ChartXY({
+		container: chartArea,
+		theme: Themes[props.theme],
+	})
+		.setTitle('Temperature and Vibration by Throughput')
+		.setCursorMode('show-nearest');
+	chart.axisX.setTitle('Temperature (°C)');
+	chart.axisY.setTitle('Vibration (mm/s)');
+	chart.setCursorFormatting((_, hit) => {
+		if (!isHitSampleXY(hit)) return undefined
+		return [
+			[{ text: 'Temperature (°C)', font: { weight: 'bold' } }, '', hit.x.toFixed(2)],
+			[{ text: 'Vibration (mm/s)', font: { weight: 'bold' } }, '', hit.y.toFixed(2)],
+			[{ text: 'Throughput', font: { weight: 'bold' } }, '', hit.size?.toFixed(0)]
+		]
+	});
+	for (let i = 0; i < 4; i += 1) {
+		chart.addPointSeries({
+			schema: {
+				temperature: { pattern: null },
+				vibration: { pattern: null },
+				throughput: { pattern: null },
+				machineId: { nonNumeric: true }
+			}
+		})
+			.setName(`Machine ${i + 1}`)
+			.setDataMapping({ x: 'temperature', y: 'vibration', size: 'throughput' });
+	}
+	let isDisposed = false;
+
+	const setupData = async () => {
+		try {
+			const allSeries = chart.getSeries();
+			let data;
+
+			if (isLocalMode()) {
+				const res = await fetch(`/api/scenarios/${props.activeScenario.fileName}`);
+				data = await res.json();
+			} else {
+				data = getMockData(props.activeScenario);
+			}
+			if (isDisposed) return;
+			for (let i = 0; i < allSeries.length; i += 1) {
+				if (data[i]) {
+					allSeries[i].appendJSON(data[i], { 
+						whitelist: ['machineId', 'temperature', 'vibration', 'throughput'] 
+					});
+				}
+			}
+		} catch (error) {
+			if (!isDisposed) {
+				console.error("Datan lataus epäonnistui:", error);
+			}
+		}
+	};
+	setupData();
+
+	return function cleanup() {
+		isDisposed = true;
+		chart.dispose();
+		lc.dispose();
+		container.innerHTML = '';
+	};
+}
+```
+
+### File: frameworks\vanillajs\src\scenarios\multi-realtime-binary.js
+```js
+import { lightningChart, Themes, AxisTickStrategies, AxisScrollStrategies, PalettedFill, LUT, ColorRGBA, SolidLine } from "@lightningchart/lcjs";
+import { isLocalMode, getMockData } from "shared";
+
+export default function multiRealtimeBinaryScenario(container, props) {
+	container.innerHTML = `
+        <div id="${props.activeScenario.id}" style="width: 100%; height: 100%;"></div>
+    `;
+	const chartArea = container.querySelector(`#${props.activeScenario.id}`);
+	const lc = lightningChart({ license: import.meta.env.VITE_LCJS_LICENSE });
+	const chart = lc.ChartXY({
+		defaultAxisX: { type: 'linear-highPrecision' },
+		legend: { visible: false },
+		container: chartArea,
+		theme: Themes[props.theme],
+	})
+		.setTitle('Real-Time Vibration Profile (M1-M3)');
+	chart.getDefaultAxisX()
+		.setTitle("Time")
+		.setTickStrategy(AxisTickStrategies.DateTime)
+		.setScrollStrategy(AxisScrollStrategies.scrolling)
+		.setDefaultInterval((state) => ({ end: state.dataMax, start: (state.dataMax ?? 0) - 10 * 1000, stopAxisAfter: false }));
+	chart.getDefaultAxisY().dispose();
+
+	const palette = new PalettedFill({
+		lookUpProperty: 'y',
+		lut: new LUT({
+			interpolate: false,
+			steps: [
+				{ value: 0, color: ColorRGBA( 255, 0, 0 ) },
+				{ value: 0.2, color: ColorRGBA( 0, 255, 0 ) },
+				{ value: 4.2, color: ColorRGBA( 255, 0, 0 ) }
+			],
+		})
+	});
+    
+	const allSeries = [];
+	for (let i = 0; i < 3; i++) {
+		const axisY = chart
+			.addAxisY({ iStack: -i })
+			.setTitleRotation(0)
+			.setMargins(i === 1 ? 15 : 0, i === 1 ? 15 : 0);
+		if (i === 1) axisY.setTitle('Vibration (mm/s)').setTitleRotation(270);
+		const series = chart.addLineSeries({ 
+			axisY, 
+			schema: {
+				timestamps: { storage: Float64Array, pattern: 'progressive' },
+				vibrations: { storage: Float32Array },
+			} 
+		})
+			.setName(`Machine ${i+1}`)
+		    // Data cleaning: set the maximum number of samples that are retained
+			.setMaxSampleCount(50_000)
+			.setDataMapping({ x: 'timestamps', y: 'vibrations' })
+			.setStrokeStyle(new SolidLine({ fillStyle: palette}));
+		allSeries.push(series);
+	}
+	let ws = null;
+	let interval = null;
+
+	if (isLocalMode()) {
+		ws = new WebSocket(`ws://localhost:3000/api/scenarios/${props.activeScenario.fileName}`);
+		ws.binaryType = "arraybuffer";
+		ws.onmessage = (e) => {
+			try {
+				const buffer = e.data;
+				const view = new DataView(buffer);
+				const machineIndex = view.getUint8(0);
+				const pointCount = (buffer.byteLength - 8) / 12;
+				const timestamps = new Float64Array(buffer, 8, pointCount);
+				const vibrations = new Float32Array(buffer, 8 + pointCount * 8, pointCount);
+				allSeries[machineIndex].appendSamples({ 
+					timestamps: timestamps, 
+					vibrations: vibrations 
+				});
+			} catch (e) { 
+				console.error(e); 
+			}
+		};
+	} else {
+		const data = getMockData(props.activeScenario);
+		let currentIndex = 0;
+		const tempTimestamps = new Float64Array(1);
+		const tempVibrations = new Float32Array(1);
+
+		interval = setInterval(() => {
+			if (currentIndex >= data[0].timestamps.length) {
+				if (interval) clearInterval(interval);
+				return;
+			}
+			for (let i = 0; i < allSeries.length; i++) {
+				const machineData = data[i];
+				tempTimestamps[0] = machineData.timestamps[currentIndex];
+				tempVibrations[0] = machineData.vibrations[currentIndex];
+				allSeries[i].appendSamples({
+					timestamps: tempTimestamps,
+					vibrations: tempVibrations
+				});
+			}
+			currentIndex++;
+		}, 20);
+	}
+
+	return function cleanup() {
+		if (ws) ws.close();
+		if (interval) clearInterval(interval);
+		chart.dispose();
+		lc.dispose();
+		container.innerHTML = '';
+	};
+}
+```
+
+### File: frameworks\vanillajs\src\scenarios\multi-realtime.js
+```js
+import { lightningChart, Themes, AxisTickStrategies, AxisScrollStrategies, PalettedFill, LUT, ColorRGBA, SolidLine } from "@lightningchart/lcjs";
+import { isLocalMode, getMockData } from "shared";
+
+export default function multiRealtimeScenario(container, props) {
+	container.innerHTML = `
+        <div id="${props.activeScenario.id}" style="width: 100%; height: 100%;"></div>
+    `;
+	const chartArea = container.querySelector(`#${props.activeScenario.id}`);
+	const lc = lightningChart({ license: import.meta.env.VITE_LCJS_LICENSE });
+	const chart = lc.ChartXY({
+		defaultAxisX: { type: 'linear-highPrecision' },
+		legend: { visible: false },
+		container: chartArea,
+		theme: Themes[props.theme],
+	})
+		.setTitle('Real-Time Vibration Profile (M1-M3)');
+	chart.getDefaultAxisX()
+		.setTitle("Time")
+		.setTickStrategy(AxisTickStrategies.DateTime)
+		.setScrollStrategy(AxisScrollStrategies.scrolling)
+		.setDefaultInterval((state) => ({ end: state.dataMax, start: (state.dataMax ?? 0) - 10 * 1000, stopAxisAfter: false }));
+	chart.getDefaultAxisY().dispose();
+
+	const palette = new PalettedFill({
+		lookUpProperty: 'y',
+		lut: new LUT({
+			interpolate: false,
+			steps: [
+				{ value: 0, color: ColorRGBA( 255, 0, 0 ) },
+				{ value: 0.2, color: ColorRGBA( 0, 255, 0 ) },
+				{ value: 4.2, color: ColorRGBA( 255, 0, 0 ) }
+			],
+		})
+	});
+    
+	const allSeries = [];
+	for (let i = 0; i < 3; i++) {
+		const axisY = chart
+			.addAxisY({ iStack: -i })
+			.setTitleRotation(0)
+			.setMargins(i === 1 ? 15 : 0, i === 1 ? 15 : 0);
+		if (i === 1) axisY.setTitle('Vibration (mm/s)').setTitleRotation(270);
+		const series = chart.addLineSeries({ 
+			axisY, 
+			schema: {
+				timestamp: { pattern: 'progressive' },
+				vibration: { pattern: null },
+				machineId: { nonNumeric: true }
+			} 
+		})
+			.setName(`Machine ${i+1}`)
+		    // Data cleaning: set the maximum number of samples that are retained
+			.setMaxSampleCount(50_000)
+			.setDataMapping({ x: 'timestamp', y: 'vibration' })
+			.setStrokeStyle(new SolidLine({ fillStyle: palette}));
+		allSeries.push(series);
+	} 
+	let ws = null;
+	let interval = null;
+
+	if (isLocalMode()) {
+		ws = new WebSocket(`ws://localhost:3000/api/scenarios/${props.activeScenario.fileName}`);
+		ws.onmessage = (e) => {
+			try {
+				const msg = JSON.parse(e.data);
+				for (let i = 0; i < allSeries.length; i++) {
+					allSeries[i].appendJSON(msg[i]);
+				};
+			} catch (e) { 
+				console.error(e); 
+			}
+		};
+	} else {
+		const data = getMockData(props.activeScenario);
+		let dataAmount = 0;
+		interval = setInterval(() => {
+			if (dataAmount >= data[0].length) {
+				if (interval) clearInterval(interval);
+				return;
+			}
+			for (let i = 0; i < allSeries.length; i++) {
+				allSeries[i].appendJSON([{
+					timestamp: data[i][dataAmount].timestamp,
+					vibration: data[i][dataAmount].vibration,
+					machineId: data[i][dataAmount].machineId
+				}]);
+			}
+			dataAmount++;
+		}, 20);
+	}
+
+	return function cleanup() {
+		if (ws) ws.close();
+		if (interval) clearInterval(interval);
+		chart.dispose();
+		lc.dispose();
+		container.innerHTML = '';
+	};
+}
+```
+
+### File: frameworks\vanillajs\src\scenarios\multi-static-binary.js
+```js
+import { lightningChart, Themes, AxisTickStrategies } from "@lightningchart/lcjs";
+import { isLocalMode, getMockData } from "shared";
+
+export default function multiStaticBinaryScenario(container, props) {
+	container.innerHTML = `
+        <div id="${props.activeScenario.id}" style="width: 100%; height: 100%;"></div>
+    `;
+	const chartArea = container.querySelector(`#${props.activeScenario.id}`);
+	const lc = lightningChart({ license: import.meta.env.VITE_LCJS_LICENSE });
+	const chart = lc.ChartXY({
+		defaultAxisX: { type: 'linear-highPrecision' },
+		container: chartArea,
+		theme: Themes[props.theme],
+	})
+		.setTitle('Comparative Thermal Analysis of Production Units');
+	chart.getDefaultAxisX().setTickStrategy(AxisTickStrategies.DateTime).setTitle('Time');
+	const axisY = chart.getDefaultAxisY().setTitle('Temperature (°C)');
+	const allSeries = [];
+	for (let i = 0; i < 3; i++) {
+		const series = chart.addLineSeries({ 
+			axisY, 
+			schema: {
+				x: { storage: Float64Array, pattern: 'progressive' },
+				y: { storage: Float32Array }
+			}
+		});
+		series.setName(`Machine ${i+1}`);
+		allSeries.push(series);
+	};
+	let isDisposed = false; 
+
+	const setupData = async () => {
+		try {
+			let arrayBuffer;
+			let pointsCount;
+			if (isLocalMode()) {
+				const res = await fetch(`/api/scenarios/${props.activeScenario.fileName}`);
+				// Parse custom header to get point counts
+				const pointsCountHeader = res.headers.get('Points-Count');
+				arrayBuffer = await res.arrayBuffer();
+				pointsCount = pointsCountHeader ? parseInt(pointsCountHeader, 10) : arrayBuffer.byteLength / 20;
+			} else {
+				const data = getMockData(props.activeScenario);
+				arrayBuffer = data.arrayBuffer;
+				pointsCount = data.pointsCount;
+			}
+			if (isDisposed || chart.isDisposed()) return;
+			const sharedTimestamps = new Float64Array(arrayBuffer, 0, pointsCount);
+			const baseTemperatureByteOffset = pointsCount * 8;
+
+			for (let i = 0; i < 3; i++) {
+				const machineByteOffset = baseTemperatureByteOffset + (i * pointsCount * 4);
+				const temperatures = new Float32Array(arrayBuffer, machineByteOffset, pointsCount);
+            
+				allSeries[i].appendSamples({
+					x: sharedTimestamps,
+					y: temperatures,
+				});
+			}
+		} catch (error) {
+			if (!isDisposed) {
+				console.error("Data fetch failed:", error);
+			}
+		}
+	};
+	setupData();
+
+	return function cleanup() {
+		isDisposed = true;
+		chart.dispose();
+		lc.dispose();
+		container.innerHTML = '';
+	};
+}
+```
+
+### File: frameworks\vanillajs\src\scenarios\multi-static.js
+```js
+import { lightningChart, Themes, AxisTickStrategies } from "@lightningchart/lcjs";
+import { isLocalMode, getMockData } from "shared";
+
+export default function multiStaticScenario(container, props) {
+	container.innerHTML = `
+        <div id="${props.activeScenario.id}" style="width: 100%; height: 100%;"></div>
+    `;
+	const chartArea = container.querySelector(`#${props.activeScenario.id}`);
+	const lc = lightningChart({ license: import.meta.env.VITE_LCJS_LICENSE });
+	const chart = lc.ChartXY({
+		defaultAxisX: { type: 'linear-highPrecision' },
+		container: chartArea,
+		theme: Themes[props.theme],
+	})
+		.setTitle('Comparative Thermal Analysis of Production Units');
+	chart.getDefaultAxisX().setTickStrategy(AxisTickStrategies.DateTime).setTitle('Time');
+	const axisY = chart.getDefaultAxisY().setTitle('Temperature (°C)');
+	const allSeries = [];
+	for (let i = 0; i < 3; i++) {
+		const series = chart.addLineSeries({ 
+			axisY, 
+			schema: {
+				timestamp: { pattern: 'progressive' },
+				temperature: { pattern: null },
+				machineId: { nonNumeric: true }
+			} 
+		})
+		series.setName(`Machine ${i+1}`).setDataMapping({ x: 'timestamp', y: 'temperature' });
+		allSeries.push(series);
+	};
+	let isDisposed = false; 
+
+	const setupData = async () => {
+		try {
+			const allSeries = chart.getSeries();
+			let data;
+			if (isLocalMode()) {
+				const res = await fetch(`/api/scenarios/${props.activeScenario.fileName}`);
+				data = await res.json();
+			} else {
+				data = getMockData(props.activeScenario);
+			}
+			if (isDisposed) return;
+            
+			for (let i = 0; i < allSeries.length; i++) {
+				allSeries[i].appendJSON(data[i]);
+			};
+		} catch (error) {
+			if (!isDisposed) {
+				console.error("Data fetch failed:", error);
+			}
+		}
+	};
+	setupData();
+
+	return function cleanup() {
+		isDisposed = true;
+		chart.dispose();
+		lc.dispose();
+		container.innerHTML = '';
+	};
+}
+```
+
+### File: frameworks\vanillajs\src\scenarios\synced-charts.js
+```js
+import { lightningChart, Themes, AxisTickStrategies, DataSetXY, synchronizeAxisIntervals } from "@lightningchart/lcjs";
+import { getMockData, isLocalMode } from 'shared';
+
+const VALUES = ['temperature', 'vibration', 'throughput'];
+const TITLES = ['Thermal Output Profile (°C)', 'Mechanical Kinematics Profile (mm/s)', 'Production Throughput Efficiency (units/s)'];
+
+export default function syncedChartsScenario(container, props) {
+	container.innerHTML = `
+        <div style="width: 100%; height: 100%; display: grid; grid-template-columns: repeat(2, 1fr); grid-template-rows: repeat(2, 1fr);">
+            <div id="dataPanel" style="padding: 8px;">Loading data...</div>
+            <div id="${props.activeScenario.id}1" style="width: 100%; height: 100%;"></div>
+            <div id="${props.activeScenario.id}2" style="width: 100%; height: 100%;"></div>
+            <div id="${props.activeScenario.id}3" style="width: 100%; height: 100%;"></div>
+        </div>
+    `;    
+	const chartArea1 = container.querySelector(`#${props.activeScenario.id}1`);
+	const chartArea2 = container.querySelector(`#${props.activeScenario.id}2`);
+	const chartArea3 = container.querySelector(`#${props.activeScenario.id}3`);
+	const dataPanel = container.querySelector(`#dataPanel`);
+	const lc = lightningChart({ license: import.meta.env.VITE_LCJS_LICENSE, });
+	const dataSet = new DataSetXY({
+		schema: {
+			timestamp: { pattern: 'progressive' },
+			temperature: { pattern: null },
+			vibration: { pattern: null },
+			throughput: { pattern: null }
+		}
+	});
+	const containers = [chartArea1, chartArea2, chartArea3];
+	const charts = containers.map((container, i) => {
+		const chart = lc.ChartXY({
+			defaultAxisX: { type: 'linear-highPrecision' },
+			theme: Themes[props.theme],
+			container: container,
+		})
+			.setTitle(`${TITLES[i]}`)
+			.setCursorMode(undefined);
+		chart.getDefaultAxisX().setTickStrategy(AxisTickStrategies.DateTime);
+		const series = chart.addLineSeries().setName(`${VALUES[i]}`);
+		const cursor = chart.addCursor();
+		cursor.setTickMarkerXVisible(false);
+		return { chart, cursor, series };
+	})
+	synchronizeAxisIntervals(...charts.map((chart) => chart.chart.axisX));
+
+	const hideCursor = () => {
+		charts.forEach((chart) => chart.cursor.setVisible(false))
+	};
+	const displayCursorAt = (x) => {
+		charts.forEach((chart) => {
+			const solveResults = chart.chart
+				.getSeries()
+			    // NOTE: Other series types don't currently have direct API syntax to solve nearest from axis coordinate - for them, you have to first translate axis coordinate to client coordinate and then use solve nearest
+				.map((series) => series.getCursorEnabled() && series.solveNearest({ x, y: 0 }))
+				.filter((solve) => !!solve);
+			if (solveResults.length > 0) {
+				chart.cursor
+					.setVisible(true)
+					.setPosition(...solveResults.map((solve) => solve.cursorPosition))
+					.setResultTable((rt) => rt.setContent(chart.chart.getCursorFormatting()(chart.chart, solveResults[0], solveResults)));
+			} else {
+				chart.cursor.setVisible(false);
+			}
+		});
+	};
+	charts.forEach((chart) => {
+		chart.chart.seriesBackground.addEventListener('pointermove', (event) =>
+			displayCursorAt(chart.chart.translateCoordinate(event, chart.chart.coordsAxis).x),
+		);
+		chart.chart.getSeries().forEach((series) => series.addEventListener('pointermove', (event, info) => displayCursorAt(info.x)));
+		chart.chart.seriesBackground.addEventListener('pointerleave', () => hideCursor());
+	});
+	let isDisposed = false; 
+    
+	const setPanelData = (data) => {
+		dataPanel.innerHTML = `
+            <strong>Synchronized Multivariate Production Telemetry</strong><br />
+            <br />
+            Production unit: <strong>Machine 1</strong><br />
+            Average temperature: <strong>${data.temp}</strong> °C<br />
+            Average vibration: <strong>${data.vib}</strong> mm/s<br />
+            Average throughput: <strong>${data.tp}</strong> units per second
+        `;
+	};
+
+	const setupData = async () => {
+		try {
+			let data;
+			if (isLocalMode()) {
+				const res = await fetch(`/api/scenarios/${props.activeScenario.fileName}`);
+				data = await res.json();
+			} else {
+				data = getMockData(props.activeScenario);
+			}
+			if (isDisposed) return;
+            
+			dataSet.appendJSON(data, { whitelist: ['timestamp', VALUES[0], VALUES[1], VALUES[2]] });
+			for (let i = 0; i < charts.length; i++) {
+				charts[i].series.setDataSet(dataSet, { x: 'timestamp', y: VALUES[i] });
+			};		
+			const countAverage = (property) => {
+				const array = dataSet.readBack().data[property];
+				let total = 0;
+				for (let i = 0; i < array.length; i++) {
+					total += array[i];
+				}
+				return total / array.length;
+			}
+			setPanelData({
+				temp: countAverage(VALUES[0]).toFixed(2),
+				vib: countAverage(VALUES[1]).toFixed(2),
+				tp: (countAverage(VALUES[2]) * 100).toFixed(0)
+			});
+		} catch (err) {
+			console.error("Failed to fetch data:", err);
+			return;
+		}
+	};
+	setupData();
+
+	return function cleanup() {
+		isDisposed = true;
+		charts.forEach(chart => chart.chart.dispose());
+		lc.dispose();
+		container.innerHTML = '';
+	};
+}
+```
+
+### File: frameworks\vanillajs\src\vanillajs-wrapper.js
+```js
+import { SCENARIOS } from "shared";
+const scenarioModules = import.meta.glob('./scenarios/*.js', { eager: true });
+
+class VanillajsScenarioElement extends HTMLElement {
+	static get observedAttributes() { return ['scenario-id', 'theme']; }
+
+	constructor() {
+		super();
+		this.cleanup = null;
+		this.shadow = this.attachShadow({ mode: "open" });
+		this.container = document.createElement("div");
+		this.container.style.width = "100%";
+		this.container.style.height = "100%";
+		this.shadow.appendChild(this.container);
+	}
+
+	connectedCallback() {
+		this.render();
+	}
+
+	attributeChangedCallback(name, oldVal, newVal) {
+		if (oldVal && oldVal !== newVal) this.render();
+	}
+
+	disconnectedCallback() {
+		if (this.cleanup) this.cleanup();
+	}
+
+	render() {
+		if (this.cleanup) this.cleanup();
+		this.container.innerHTML = '';
+		// Read the tags from HTML element's attributes (created in the shell app)
+		const theme = this.getAttribute("theme") ?? "darkGold";
+		const scenarioId = this.getAttribute("scenario-id");
+		const scenario = SCENARIOS.find(s => s.id === scenarioId);
+
+		if (scenario) {
+			// Get the right module from Vite's Library
+			const module = scenarioModules[`./scenarios/${scenario.fileName}.js`];
+			if (module) {
+				// Call ScenarioFunction and pass the container and properties
+				// ScenarioFunction returns a cleanup function that is saved to "this.cleanup"
+				const ScenarioFunction = module.default || Object.values(module)[0];
+				this.cleanup = ScenarioFunction(this.container, { activeScenario: scenario, theme });
+				return;
+			}
+		}
+		console.error(`Vanilla JS scenario not found: ${scenarioId}`);
+	}
+}
+if (!customElements.get("vanillajs-scenario")) {
+	customElements.define("vanillajs-scenario", VanillajsScenarioElement);
+}
+```
+
+### File: frameworks\vanillajs\src\vite-env.d.ts
+```ts
+/// <reference types="vite/client" />
+
+interface ImportMetaEnv {
+  readonly VITE_LCJS_LICENSE: string;
+}
+
+interface ImportMeta {
+  readonly env: ImportMetaEnv;
+}
+```
+

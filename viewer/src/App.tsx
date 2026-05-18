@@ -1,0 +1,221 @@
+import '@mantine/core/styles.css';
+import '@mantine/code-highlight/styles.css';
+import { MantineProvider, Title, Paper, Box, ScrollArea, NavLink, Group, CopyButton, Tooltip, Button } from '@mantine/core';
+import { CodeHighlightAdapterProvider, createShikiAdapter, CodeHighlight } from '@mantine/code-highlight';
+import { Group as ResizableGroup, Panel, Separator} from 'react-resizable-panels';
+import { Copy, Check } from 'lucide-react';
+import { useEffect, useState, useRef, useMemo } from 'react';
+import ReactMarkdown from 'react-markdown';
+import { SCENARIOS, FRAMEWORKS } from 'shared';
+import logo from '../../shared/assets/logo.svg';
+
+// Parse all code view files in ?raw format at build
+const backendImports = import.meta.glob('../../backend/src/scenarios/*.ts', {
+	query: '?raw',
+	import: 'default',
+});
+const frontendImports = import.meta.glob('../../frameworks/*/src/scenarios/*.{tsx,vue,ts,svelte,js}', {
+	query: '?raw',
+	import: 'default',
+});
+
+
+async function loadShiki() {
+	const { createHighlighter } = await import('shiki');
+	const shiki = await createHighlighter({
+		langs: ['typescript', 'angular-ts', 'javascript', 'vue', 'svelte'],
+		themes: [],
+	});
+	return shiki;
+}
+
+const shikiAdapter = createShikiAdapter(loadShiki);
+
+const ScenarioLoader = ({ frameworkId, scenarioId, theme }: { frameworkId: string, scenarioId: string, theme: string }) => {
+	const containerRef = useRef<HTMLDivElement>(null);
+
+	useEffect(() => {
+		const scenario = SCENARIOS.find(s => s.id === scenarioId);
+		if (!scenario || !containerRef.current) return;
+		const bundleUrl = `/frameworks/${frameworkId}/dist/${frameworkId}-scenarios.js`;
+		const container = containerRef.current;
+
+		const mountComponent = async () => {
+			try {
+				// Load Web Component -bundle
+				// Tell Vite to not package this file during build, because it's being fetched during runtime
+				await import(/* @vite-ignore */ bundleUrl);
+				const element = document.createElement(`${frameworkId}-scenario`);
+				// Set a tag for the framework wrapper to read
+				element.setAttribute("theme", theme);
+				element.setAttribute("scenario-id", scenarioId);
+				element.style.width = '100%';
+				element.style.height = '100%';
+				if (container) {
+					container.innerHTML = '';
+					container.appendChild(element);
+				}
+			} catch (e) {
+				console.error("Failed loading Web Component", e);
+			}
+		};
+		mountComponent();
+		return () => { 
+			if (container) container.innerHTML = ''; 
+		};
+	}, [frameworkId, scenarioId, theme]);
+
+	return <Box ref={containerRef} h="100%" w="100%" />;
+};
+
+const CodeView = ({ title, code, language }: { title: string; code: string; language?: string }) => {
+	return (
+		<Paper h="100%" withBorder radius={0} style={{ display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+			<Group justify="space-between" p="xs" bg="var(--mantine-color-dark-7)" style={{ borderBottom: '1px solid var(--mantine-color-dark-4)' }}>
+				<Title order={6} size="xs" c="gray.3" fw={600}>{title}</Title>
+				<CopyButton value={code} timeout={2000}>
+					{({ copied, copy }) => (
+						<Tooltip label={copied ? 'Copied!' : 'Copy code'} withArrow position="left">
+							<Button color={copied ? 'teal' : 'gray'} variant="subtle" onClick={copy} size="xs" px={5} miw={40}>
+								{copied ? <Check size={16} /> : <Copy size={16} />}
+							</Button>
+						</Tooltip>
+					)}
+				</CopyButton>
+			</Group>
+			<ScrollArea style={{ flex: 1 }} bg="var(--mantine-color-dark-9)">
+				<CodeHighlight 
+					code={code} 
+					language={language} 
+					withCopyButton={false}
+					styles={{
+						code: { backgroundColor: 'transparent' },
+						pre: { backgroundColor: 'transparent', padding: '0rem' }
+					}}
+				/>
+			</ScrollArea>
+		</Paper>
+	);
+};
+
+function App() {
+	const [theme, setTheme] = useState("darkGold");
+	const [isIntroVisible, setIsIntroVisible] = useState(false);
+	const [scenarioId, setScenarioId] = useState(SCENARIOS[0].id);
+	const [frameworkId, setFrameworkId] = useState(FRAMEWORKS[0].id);
+	const [backendCode, setBackendCode] = useState<string>("Loading backend code...");
+	const [frontendCode, setFrontendCode] = useState<string>("Loading frontend code...");
+	const [language, setLanguage] = useState('typescript');
+
+	const activeScenario = useMemo(() => 
+		SCENARIOS.find(s => s.id === scenarioId) || SCENARIOS[0], 
+	[scenarioId]);
+
+	const activeFramework = useMemo(() => 
+		FRAMEWORKS.find(f => f.id === frameworkId) || FRAMEWORKS[0], 
+	[frameworkId]);
+
+	// Fetch code as text when scenario/framework changes
+	useEffect(() => {
+		const fetchCodes = async () => {
+			try {
+				const getBackCode = backendImports[`../../backend/src/scenarios/${activeScenario.fileName}.ts`];
+				const getFrontCode = frontendImports[`../../frameworks/${activeFramework.id}/src/scenarios/${activeScenario.fileName}.${activeFramework.extension}`];
+				if (getBackCode) {
+					const backCode = await getBackCode() as string;
+					setBackendCode(backCode);
+				}
+				if (getFrontCode) {
+					const frontCode = await getFrontCode() as string;
+					setFrontendCode(frontCode);
+				}
+				setLanguage(activeFramework.language);
+			} catch (error) {
+				console.error("Error loading code:", error);
+			}
+		};
+		fetchCodes();
+	}, [activeScenario, activeFramework]);
+
+	useEffect(() => {
+		console.log('Current theme: ', theme);
+	}, [theme]);
+  
+	return (
+		<MantineProvider defaultColorScheme="dark">
+			<CodeHighlightAdapterProvider adapter={shikiAdapter}>
+				<Box h="100vh" w="100vw" style={{ display: 'flex', overflow: 'hidden' }}>
+					{/* Left side: navigation */}      
+					<Box component="nav" className="box-left">
+						<ScrollArea h="100%" p="sm">
+							<img src={logo} alt="Logo" />
+							<NavLink label="Introduction" onClick={() => setIsIntroVisible(true)} fw="700" mt="sm" c="yellow.4">
+							</NavLink>
+							<NavLink href="#required-for-focus" label="Frameworks" fw="700" mt="sm" c="yellow.4" childrenOffset={20} defaultOpened>
+								{FRAMEWORKS.map((f) => (
+									<NavLink
+										key={f.id}
+										label={f.label}
+										active={frameworkId === f.id}
+										onClick={() => {setFrameworkId(f.id); setIsIntroVisible(false)}}
+										variant="light"
+										style={{ color: 'goldenrod', borderRadius: '4px' }}
+									/>
+								))}
+							</NavLink>
+							<NavLink href="#required-for-focus" label="Scenarios" fw="700" mt="sm" c="yellow.4" childrenOffset={20} defaultOpened>
+								{SCENARIOS.map((s) => (
+									<NavLink
+										key={s.id}
+										label={s.label}
+										active={scenarioId === s.id}
+										onClick={() => {setScenarioId(s.id); setIsIntroVisible(false)}}
+										variant="light"
+										style={{ color: 'goldenrod', borderRadius: '4px' }}
+									/>
+								))}
+							</NavLink>
+						</ScrollArea>
+					</Box>
+					{/* Right side */}
+					<Box className="box-right">
+						{isIntroVisible ? 
+							<Box h="100%" bg="#050505"style={{ position: 'relative' }}>
+								ADD INTRO ELEMENT HERE
+							</Box>
+							: 
+							<ResizableGroup orientation="vertical">
+								{/* Info panel */}
+								<Panel defaultSize={10} minSize={10}>
+									<ReactMarkdown>{activeScenario.info}</ReactMarkdown>
+								</Panel>
+								<Separator className="v-resize-handle" />
+								{/* Code views */}
+								<Panel defaultSize={45} minSize={20}>
+									<ResizableGroup orientation="horizontal">
+										<Panel defaultSize={50} minSize={20}>
+											<CodeView title="Backend" code={backendCode} language={'typescript'} />
+										</Panel>
+										<Separator className="h-resize-handle" />
+										<Panel defaultSize={50} minSize={20}>
+											<CodeView title={`Component (${activeFramework.label})`} code={frontendCode} language={language} />
+										</Panel>
+									</ResizableGroup>
+								</Panel>
+								<Separator className="v-resize-handle" />
+								{/* Chart view */}
+								<Panel defaultSize={45} minSize={20}>
+									<Box h="100%" bg="#050505"style={{ position: 'relative' }}>
+										<ScenarioLoader frameworkId={frameworkId} scenarioId={scenarioId} theme={theme} />
+									</Box>
+								</Panel>
+							</ResizableGroup>
+						}
+					</Box>
+				</Box>
+			</CodeHighlightAdapterProvider>
+		</MantineProvider>
+	);
+}
+
+export default App;
