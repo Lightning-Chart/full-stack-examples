@@ -37,7 +37,7 @@ const ScenarioLoader = ({ frameworkId, scenarioId, theme }: { frameworkId: strin
 	useEffect(() => {
 		const scenario = SCENARIOS.find(s => s.id === scenarioId);
 		if (!scenario || !containerRef.current) return;
-		const bundleUrl = `/frameworks/${frameworkId}/dist/${frameworkId}-scenarios.js`;
+		const bundleUrl = `${import.meta.env.BASE_URL}frameworks/${frameworkId}/dist/${frameworkId}-scenarios.js`;
 		const container = containerRef.current;
 
 		const mountComponent = async () => {

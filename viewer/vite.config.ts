@@ -3,7 +3,10 @@ import react from '@vitejs/plugin-react';
 import path from 'node:path';
 import sirv from 'sirv';
 
-export default defineConfig({
+const githubPagesBase = '/full-stack-examples/';
+
+export default defineConfig(() => ({
+	base: process.env.GITHUB_ACTIONS === 'true' ? githubPagesBase : '/',
 	plugins: [
 		react(),
 		{
@@ -41,4 +44,4 @@ export default defineConfig({
 			allow: ['..'],
 		},
 	},
-})
+}))
